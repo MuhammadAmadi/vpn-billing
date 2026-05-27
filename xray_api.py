@@ -40,30 +40,33 @@ def _skip_for_tariff(remark: str, tariff: str) -> bool:
     return tariff == "Standard" and _is_premium(remark)
 
 
-async def get_session_cookie(client: httpx.AsyncClient, server: dict) -> dict | None:
+async def get_auth_kwargs(client: httpx.AsyncClient, server: dict) -> dict | None:
+    """Возвращает {'headers': {...}, 'cookies': {...}} или None при ошибке."""
+    # Если есть токен, используем его (куки не нужны)
+    if server.get("api_token"):
+        return {
+            "headers": {
+                "Accept": "application/json",
+                "Authorization": f"Bearer {server['api_token']}"
+            },
+            "cookies": None
+        }
+
+    # Иначе авторизуемся по старинке через логин/пароль
     base_url = _base_url(server)
     try:
         resp = await client.post(
             f"{base_url}/login",
-            json={"username": server["login"], "password": server["password"]},
+            json={"username": server.get("login", ""), "password": server.get("password", "")},
             timeout=HTTP_TIMEOUT,
         )
         if resp.status_code == 200 and resp.json().get("success"):
             log.debug("Авторизация на %s успешна", server["name"])
-            return dict(resp.cookies)
+            return {"headers": {"Accept": "application/json"}, "cookies": dict(resp.cookies)}
         log.warning("Авторизация на %s не удалась (HTTP %s)", server["name"], resp.status_code)
-        await log_error(
-            f"Авторизация не удалась (HTTP {resp.status_code})",
-            source="xray_api", server_name=server.get("name"),
-            level="error", details=resp.text[:500],
-        )
     except Exception as e:
         log.error("Ошибка авторизации на %s: %s", server["name"], e)
-        await log_error(
-            "Сервер недоступен (ошибка авторизации)",
-            source="xray_api", server_name=server.get("name"),
-            level="error", details=f"{type(e).__name__}: {e}",
-        )
+        pass
     return None
 
 
@@ -151,24 +154,25 @@ def _resolve_bypass_host(remark: str, server_host: str,
 
 
 async def _fetch_inbounds(client: httpx.AsyncClient, base_url: str,
-                          cookies: dict, server_name: str) -> list[dict]:
-    headers = {"Accept": "application/json"}
+                          auth_kwargs: dict, server_name: str) -> list[dict]:
+    # Распаковываем **auth_kwargs прямо в запрос.
+    # В них уже лежит нужный Accept: application/json
     resp = await client.get(
         f"{base_url}/panel/api/inbounds/list",
-        headers=headers, cookies=cookies, timeout=HTTP_TIMEOUT,
+        timeout=HTTP_TIMEOUT, **auth_kwargs
     )
     inbounds = resp.json().get("obj", [])
     log.debug("%s: найдено %s inbound(ов)", server_name, len(inbounds))
     return inbounds
 
-
-async def _add_client(client: httpx.AsyncClient, base_url: str, cookies: dict,
+async def _add_client(client: httpx.AsyncClient, base_url: str, auth_kwargs: dict,
                       inbound_id: int, uuid: str, email: str) -> bool:
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
     payload = {"id": inbound_id, "settings": json.dumps(_client_payload(uuid, email))}
+    # Заголовки и куки подтянутся из **auth_kwargs,
+    # а httpx сам добавит Content-Type благодаря параметру json=payload
     resp = await client.post(
         f"{base_url}/panel/api/inbounds/addClient",
-        headers=headers, cookies=cookies, json=payload,
+        json=payload, **auth_kwargs
     )
     return resp.status_code == 200 and resp.json().get("success")
 
@@ -183,19 +187,23 @@ async def add_client_to_all_servers(client_uuid: str, email: str,
     async with httpx.AsyncClient(verify=False) as client:
         for server in servers:
             base_url = _base_url(server)
-            cookies = await get_session_cookie(client, server)
-            if not cookies:
+            auth_kwargs = await get_auth_kwargs(client, server)  # Изменено
+
+            if not auth_kwargs:  # Изменено
                 log.warning("Пропускаю %s — нет авторизации", server["name"])
                 continue
             try:
-                inbounds = await _fetch_inbounds(client, base_url, cookies, server["name"])
+                # Передаем auth_kwargs
+                inbounds = await _fetch_inbounds(client, base_url, auth_kwargs, server["name"])
                 for inbound in inbounds:
                     remark = inbound.get("remark", "")
                     if _skip_for_tariff(remark, tariff):
                         continue
                     inbound_id = inbound.get("id")
                     unique_email = f"{email}_i{inbound_id}"
-                    if not await _add_client(client, base_url, cookies, inbound_id,
+
+                    # Передаем auth_kwargs
+                    if not await _add_client(client, base_url, auth_kwargs, inbound_id,
                                              client_uuid, unique_email):
                         await log_error(
                             "addClient вернул ошибку",
@@ -225,11 +233,12 @@ async def remove_client_from_all_servers(client_uuid: str) -> None:
     async with httpx.AsyncClient(verify=False) as client:
         for server in servers:
             base_url = _base_url(server)
-            cookies = await get_session_cookie(client, server)
-            if not cookies:
+            auth_kwargs = await get_auth_kwargs(client, server)  # Изменено
+
+            if not auth_kwargs:  # Изменено
                 continue
             try:
-                inbounds = await _fetch_inbounds(client, base_url, cookies, server["name"])
+                inbounds = await _fetch_inbounds(client, base_url, auth_kwargs, server["name"])
                 for inbound in inbounds:
                     inbound_id = inbound["id"]
                     real_uuid = next(
@@ -239,9 +248,11 @@ async def remove_client_from_all_servers(client_uuid: str) -> None:
                     )
                     if not real_uuid:
                         continue
+
+                    # Используем **auth_kwargs вместо жестких headers и cookies
                     await client.post(
                         f"{base_url}/panel/api/inbounds/{inbound_id}/delClient/{real_uuid}",
-                        headers={"Accept": "application/json"}, cookies=cookies,
+                        **auth_kwargs
                     )
                     log.debug("delClient %s inbound=%s", server["name"], inbound_id)
             except Exception as e:
@@ -258,12 +269,14 @@ async def update_client_uuid_on_all_servers(old_uuid: str, new_uuid: str, email:
     async with httpx.AsyncClient(verify=False) as client:
         for server in servers:
             base_url = _base_url(server)
-            cookies = await get_session_cookie(client, server)
-            if not cookies:
+            auth_kwargs = await get_auth_kwargs(client, server)  # Изменено
+
+            if not auth_kwargs:  # Изменено
                 continue
-            headers = {"Accept": "application/json", "Content-Type": "application/json"}
+
+            # Строку 'headers = ...' удаляем, httpx сам всё сделает
             try:
-                inbounds = await _fetch_inbounds(client, base_url, cookies, server["name"])
+                inbounds = await _fetch_inbounds(client, base_url, auth_kwargs, server["name"])
                 for inbound in inbounds:
                     remark = inbound.get("remark", "")
                     if _is_private(remark) or _is_premium(remark):
@@ -278,15 +291,17 @@ async def update_client_uuid_on_all_servers(old_uuid: str, new_uuid: str, email:
                     payload = {"id": inbound_id, "settings": json.dumps(_client_payload(new_uuid, unique_email))}
                     if not real_uuid:
                         log.info("%s: %s не найден, добавляю заново", server["name"], unique_email)
+                        # Используем json=payload и **auth_kwargs
                         await client.post(
                             f"{base_url}/panel/api/inbounds/addClient",
-                            headers=headers, cookies=cookies, json=payload,
+                            json=payload, **auth_kwargs
                         )
                         continue
+
+                    # Используем json=payload и **auth_kwargs
                     await client.post(
                         f"{base_url}/panel/api/inbounds/updateClient/{real_uuid}",
-                        headers=headers, cookies=cookies,
-                        data=json.dumps(payload), timeout=HTTP_TIMEOUT,
+                        json=payload, timeout=HTTP_TIMEOUT, **auth_kwargs
                     )
                     log.debug("updateClient %s inbound=%s: %s → %s",
                               server["name"], inbound_id, real_uuid, new_uuid)
@@ -309,11 +324,12 @@ async def get_client_links_from_all_servers(client_uuid: str, email: str,
     async with httpx.AsyncClient(verify=False) as client:
         for server in servers:
             base_url = _base_url(server)
-            cookies = await get_session_cookie(client, server)
-            if not cookies:
+            auth_kwargs = await get_auth_kwargs(client, server)  # Изменено
+
+            if not auth_kwargs:  # Изменено
                 continue
             try:
-                inbounds = await _fetch_inbounds(client, base_url, cookies, server["name"])
+                inbounds = await _fetch_inbounds(client, base_url, auth_kwargs, server["name"])
                 for inbound in inbounds:
                     remark = inbound.get("remark", "")
                     if _skip_for_tariff(remark, tariff):
@@ -329,7 +345,8 @@ async def get_client_links_from_all_servers(client_uuid: str, email: str,
 
                     if not real_uuid:
                         log.info("%s: %s не найден на сервере, добавляю", server["name"], unique_email)
-                        if not await _add_client(client, base_url, cookies, inbound_id,
+                        # Передаем auth_kwargs
+                        if not await _add_client(client, base_url, auth_kwargs, inbound_id,
                                                  client_uuid, unique_email):
                             await log_error(
                                 "Авто-добавление клиента не удалось",
@@ -356,24 +373,22 @@ async def get_client_links_from_all_servers(client_uuid: str, email: str,
 
 
 async def test_server(server: dict) -> tuple[bool, str]:
-    """Залогиниться и получить inbound'ы — для кнопки 'Тест' в админ-панели."""
     base_url = _base_url(server)
     try:
         async with httpx.AsyncClient(verify=False) as client:
-            resp = await client.post(
-                f"{base_url}/login",
-                json={"username": server["login"], "password": server["password"]},
-                timeout=HTTP_TIMEOUT,
-            )
-            if resp.status_code != 200 or not resp.json().get("success"):
-                return False, f"Авторизация не удалась (HTTP {resp.status_code})"
-            cookies = dict(resp.cookies)
+            auth_kwargs = await get_auth_kwargs(client, server)
+            if not auth_kwargs:
+                return False, "Авторизация не удалась (проверьте логин/пароль или токен)"
+
             lst = await client.get(
                 f"{base_url}/panel/api/inbounds/list",
-                headers={"Accept": "application/json"}, cookies=cookies, timeout=HTTP_TIMEOUT,
+                timeout=HTTP_TIMEOUT,
+                **auth_kwargs
             )
-            inbounds = lst.json().get("obj", [])
-            return True, f"OK — доступен, inbound'ов: {len(inbounds)}"
+            if lst.status_code == 200 and lst.json().get("success"):
+                inbounds = lst.json().get("obj", [])
+                return True, f"OK — доступен, inbound'ов: {len(inbounds)}"
+            return False, f"Ошибка API (HTTP {lst.status_code})"
     except Exception as e:
         return False, f"Недоступен: {type(e).__name__}: {e}"
 

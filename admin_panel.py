@@ -168,6 +168,7 @@ async def api_server_test(request: Request):
                 "host": data.get("host", ""), "port": int(data.get("port", 2053)),
                 "base_path": data.get("base_path", ""), "login": data.get("login", "admin"),
                 "password": data.get("password", "admin"),
+                "api_token": data.get("api_token", ""),
             }
         if not server:
             return {"status": "error", "msg": "Сервер не найден"}
@@ -730,9 +731,25 @@ DASHBOARD_HTML = """<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">
       <div><label class="text-xs text-gray-400">Порт</label><input id="f-port" class="inp" value="2053"></div>
       <div class="col-span-2"><label class="text-xs text-gray-400">Host</label><input id="f-host" class="inp" placeholder="appaz.xyz"></div>
       <div class="col-span-2"><label class="text-xs text-gray-400">Base path (без слэшей)</label><input id="f-base_path" class="inp" placeholder="ac0b8e07..."></div>
-      <div><label class="text-xs text-gray-400">Логин панели</label><input id="f-login" class="inp" value="admin"></div>
-      <div><label class="text-xs text-gray-400">Пароль панели</label><input id="f-password" class="inp" type="text"></div>
-    </div>
+      
+      <div class="col-span-2">
+        <label class="text-xs text-gray-400">Тип авторизации</label>
+        <select id="f-auth-type" class="inp" onchange="toggleAuthFields()">
+          <option value="login">Логин и пароль</option>
+          <option value="token">API Токен</option>
+        </select>
+      </div>
+      
+      <div id="wrap-login" class="col-span-2 grid grid-cols-2 gap-3">
+        <div><label class="text-xs text-gray-400">Логин панели</label><input id="f-login" class="inp" value="admin"></div>
+        <div><label class="text-xs text-gray-400">Пароль панели</label><input id="f-password" class="inp" type="text"></div>
+      </div>
+
+      <div id="wrap-token" class="col-span-2 hidden">
+        <label class="text-xs text-gray-400">API Токен (Bearer)</label>
+        <input id="f-api_token" class="inp" placeholder="Токен из настроек 3x-ui">
+      </div>
+      </div>
     <label class="flex items-center gap-2 mt-4 text-sm"><input id="f-active" type="checkbox" checked class="w-4 h-4"> Сервер включён</label>
     <p id="test-result" class="text-sm mt-3 hidden px-3 py-2 rounded-lg"></p>
     <div class="grid grid-cols-3 gap-3 mt-5">
@@ -805,6 +822,12 @@ function switchTab(t){
 }
 
 /* ---- СЕРВЕРЫ ---- */
+function toggleAuthFields() {
+  const isToken = document.getElementById('f-auth-type').value === 'token';
+  document.getElementById('wrap-login').classList.toggle('hidden', isToken);
+  document.getElementById('wrap-token').classList.toggle('hidden', !isToken);
+}
+
 async function loadServers(){
   const j=await(await fetch('/admin/api/servers')).json(); servers=j.servers||[];
   const box=document.getElementById('servers-list');
@@ -859,15 +882,33 @@ function openServerModal(id){
   document.getElementById('f-base_path').value=s?s.base_path:'';
   document.getElementById('f-login').value=s?s.login:'admin';
   document.getElementById('f-password').value=s?s.password:'';
+  
+  // Добавляем загрузку токена
+  document.getElementById('f-api_token').value=s?(s.api_token||''):'';
+  
+  // Переключаем интерфейс в зависимости от того, есть ли токен
+  document.getElementById('f-auth-type').value=(s && s.api_token) ? 'token' : 'login';
+  toggleAuthFields();
+  
   document.getElementById('f-active').checked=s?s.is_active:true;
   document.getElementById('test-result').classList.add('hidden');
   showModal('server-modal');
 }
-function serverForm(){return{id:document.getElementById('f-id').value||null,name:document.getElementById('f-name').value.trim(),
-  scheme:document.getElementById('f-scheme').value,port:parseInt(document.getElementById('f-port').value)||2053,
-  host:document.getElementById('f-host').value.trim(),base_path:document.getElementById('f-base_path').value.trim().replace(/^\\/+|\\/+$/g,''),
-  login:document.getElementById('f-login').value.trim(),password:document.getElementById('f-password').value,
-  is_active:document.getElementById('f-active').checked};}
+function serverForm() {
+  const authType = document.getElementById('f-auth-type').value;
+  return {
+    id: document.getElementById('f-id').value || null,
+    name: document.getElementById('f-name').value.trim(),
+    scheme: document.getElementById('f-scheme').value,
+    port: parseInt(document.getElementById('f-port').value) || 2053,
+    host: document.getElementById('f-host').value.trim(),
+    base_path: document.getElementById('f-base_path').value.trim().replace(/^\/+|\/+$/g, ''),
+    login: authType === 'login' ? document.getElementById('f-login').value.trim() : "",
+    password: authType === 'login' ? document.getElementById('f-password').value : "",
+    api_token: authType === 'token' ? document.getElementById('f-api_token').value.trim() : "",
+    is_active: document.getElementById('f-active').checked
+  };
+}
 async function saveServer(){const j=await(await fetch('/admin/api/server/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(serverForm())})).json();
   if(j.status==='ok'){closeModal();loadServers();}else alert(j.msg||'Ошибка');}
 async function deleteServer(id){if(!confirm('Удалить сервер? Клиенты на нём перестанут получать ссылки.'))return;
