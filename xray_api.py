@@ -40,6 +40,38 @@ def _skip_for_tariff(remark: str, tariff: str) -> bool:
     return tariff == "Standard" and _is_premium(remark)
 
 
+def _parse_json_field(value, default=None):
+    """3x-ui в разных версиях отдаёт settings/streamSettings то JSON-строкой,
+    то готовым dict-ом. Эта функция нормализует оба варианта и не падает
+    на None / пустой строке / битом JSON — возвращает default ({})."""
+    if default is None:
+        default = {}
+    if value is None or value == "":
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return default
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            return default
+    return default
+
+
+def _safe_json(resp) -> dict:
+    """resp.json() с проглатыванием ошибок парсинга — всегда отдаёт dict."""
+    try:
+        data = resp.json()
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 async def get_auth_kwargs(client: httpx.AsyncClient, server: dict) -> dict | None:
     """Возвращает {'headers': {...}, 'cookies': {...}} или None при ошибке."""
     # Если есть токен, используем его (куки не нужны)
@@ -60,13 +92,12 @@ async def get_auth_kwargs(client: httpx.AsyncClient, server: dict) -> dict | Non
             json={"username": server.get("login", ""), "password": server.get("password", "")},
             timeout=HTTP_TIMEOUT,
         )
-        if resp.status_code == 200 and resp.json().get("success"):
+        if resp.status_code == 200 and _safe_json(resp).get("success"):
             log.debug("Авторизация на %s успешна", server["name"])
             return {"headers": {"Accept": "application/json"}, "cookies": dict(resp.cookies)}
         log.warning("Авторизация на %s не удалась (HTTP %s)", server["name"], resp.status_code)
     except Exception as e:
         log.error("Ошибка авторизации на %s: %s", server["name"], e)
-        pass
     return None
 
 
@@ -74,7 +105,7 @@ def build_vless_link(client_uuid: str, email: str, server_host: str,
                      inbound: dict, custom_name: str | None = None) -> str:
     port = inbound.get("port", 443)
     remark = inbound.get("remark", "").strip()
-    stream = json.loads(inbound.get("streamSettings", "{}"))
+    stream = _parse_json_field(inbound.get("streamSettings"))
 
     external_proxy = stream.get("externalProxy", [])
     if external_proxy:
@@ -144,6 +175,16 @@ def _client_payload(uuid: str, email: str) -> dict:
     }
 
 
+def _find_client_uuid(inbound: dict, unique_email: str) -> str | None:
+    """Ищет UUID клиента по email в settings.clients (авторитетный источник).
+    clientStats — это только статистика трафика, поля uuid там нет."""
+    settings = _parse_json_field(inbound.get("settings"))
+    for c in settings.get("clients", []):
+        if c.get("email") == unique_email:
+            return c.get("id")
+    return None
+
+
 def _resolve_bypass_host(remark: str, server_host: str,
                          bypass_ips: list[str], counter: int) -> tuple[str, str | None, int]:
     """Если inbound помечен как BYPASS — возвращает (адрес из списка, имя 'ОБХОД N', новый счётчик)."""
@@ -155,26 +196,23 @@ def _resolve_bypass_host(remark: str, server_host: str,
 
 async def _fetch_inbounds(client: httpx.AsyncClient, base_url: str,
                           auth_kwargs: dict, server_name: str) -> list[dict]:
-    # Распаковываем **auth_kwargs прямо в запрос.
-    # В них уже лежит нужный Accept: application/json
     resp = await client.get(
         f"{base_url}/panel/api/inbounds/list",
         timeout=HTTP_TIMEOUT, **auth_kwargs
     )
-    inbounds = resp.json().get("obj", [])
+    inbounds = _safe_json(resp).get("obj") or []
     log.debug("%s: найдено %s inbound(ов)", server_name, len(inbounds))
     return inbounds
+
 
 async def _add_client(client: httpx.AsyncClient, base_url: str, auth_kwargs: dict,
                       inbound_id: int, uuid: str, email: str) -> bool:
     payload = {"id": inbound_id, "settings": json.dumps(_client_payload(uuid, email))}
-    # Заголовки и куки подтянутся из **auth_kwargs,
-    # а httpx сам добавит Content-Type благодаря параметру json=payload
     resp = await client.post(
         f"{base_url}/panel/api/inbounds/addClient",
-        json=payload, **auth_kwargs
+        json=payload, timeout=HTTP_TIMEOUT, **auth_kwargs
     )
-    return resp.status_code == 200 and resp.json().get("success")
+    return resp.status_code == 200 and _safe_json(resp).get("success", False)
 
 
 async def add_client_to_all_servers(client_uuid: str, email: str,
@@ -244,18 +282,13 @@ async def remove_client_from_all_servers(client_uuid: str) -> None:
                 inbounds = await _fetch_inbounds(client, base_url, auth_kwargs, server["name"])
                 for inbound in inbounds:
                     inbound_id = inbound["id"]
-                    real_uuid = next(
-                        (s.get("uuid") for s in inbound.get("clientStats", [])
-                         if s.get("uuid") == client_uuid),
-                        None,
-                    )
-                    if not real_uuid:
+                    settings = _parse_json_field(inbound.get("settings"))
+                    if not any(c.get("id") == client_uuid for c in settings.get("clients", [])):
                         continue
 
-                    # Используем **auth_kwargs вместо жестких headers и cookies
                     await client.post(
-                        f"{base_url}/panel/api/inbounds/{inbound_id}/delClient/{real_uuid}",
-                        **auth_kwargs
+                        f"{base_url}/panel/api/inbounds/{inbound_id}/delClient/{client_uuid}",
+                        timeout=HTTP_TIMEOUT, **auth_kwargs
                     )
                     log.debug("delClient %s inbound=%s", server["name"], inbound_id)
             except Exception as e:
@@ -277,7 +310,6 @@ async def update_client_uuid_on_all_servers(old_uuid: str, new_uuid: str, email:
             if not auth_kwargs:  # Изменено
                 continue
 
-            # Строку 'headers = ...' удаляем, httpx сам всё сделает
             try:
                 inbounds = await _fetch_inbounds(client, base_url, auth_kwargs, server["name"])
                 for inbound in inbounds:
@@ -286,22 +318,16 @@ async def update_client_uuid_on_all_servers(old_uuid: str, new_uuid: str, email:
                         continue
                     inbound_id = inbound["id"]
                     unique_email = f"{email}_i{inbound_id}"
-                    real_uuid = next(
-                        (s.get("uuid") for s in inbound.get("clientStats", [])
-                         if s.get("email") == unique_email),
-                        None,
-                    )
+                    real_uuid = _find_client_uuid(inbound, unique_email)
                     payload = {"id": inbound_id, "settings": json.dumps(_client_payload(new_uuid, unique_email))}
                     if not real_uuid:
                         log.info("%s: %s не найден, добавляю заново", server["name"], unique_email)
-                        # Используем json=payload и **auth_kwargs
                         await client.post(
                             f"{base_url}/panel/api/inbounds/addClient",
-                            json=payload, **auth_kwargs
+                            json=payload, timeout=HTTP_TIMEOUT, **auth_kwargs
                         )
                         continue
 
-                    # Используем json=payload и **auth_kwargs
                     await client.post(
                         f"{base_url}/panel/api/inbounds/updateClient/{real_uuid}",
                         json=payload, timeout=HTTP_TIMEOUT, **auth_kwargs
@@ -339,16 +365,10 @@ async def get_client_links_from_all_servers(client_uuid: str, email: str,
                         continue
                     inbound_id = inbound["id"]
                     unique_email = f"{email}_i{inbound_id}"
-                    settings = json.loads(inbound.get("settings", "{}"))
-                    clients = settings.get("clients", [])
-                    real_uuid = next(
-                        (c.get("id") for c in clients if c.get("email") == unique_email),
-                        None,
-                    )
+                    real_uuid = _find_client_uuid(inbound, unique_email)
 
                     if not real_uuid:
                         log.info("%s: %s не найден на сервере, добавляю", server["name"], unique_email)
-                        # Передаем auth_kwargs
                         if not await _add_client(client, base_url, auth_kwargs, inbound_id,
                                                  client_uuid, unique_email):
                             await log_error(
@@ -391,8 +411,9 @@ async def test_server(server: dict) -> tuple[bool, str]:
                 timeout=HTTP_TIMEOUT,
                 **auth_kwargs
             )
-            if lst.status_code == 200 and lst.json().get("success"):
-                inbounds = lst.json().get("obj", [])
+            data = _safe_json(lst)
+            if lst.status_code == 200 and data.get("success"):
+                inbounds = data.get("obj") or []
                 return True, f"OK — доступен, inbound'ов: {len(inbounds)}"
             return False, f"Ошибка API (HTTP {lst.status_code})"
     except Exception as e:
