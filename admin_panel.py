@@ -177,6 +177,18 @@ async def api_server_test(request: Request):
         return {"status": "error", "msg": str(e)}
 
 
+@router.get("/api/servers/health")
+async def api_servers_health(request: Request):
+    """Параллельно проверяет все включённые серверы. Для авто-индикации в UI."""
+    if not _is_authed(request):
+        return _need_login_json()
+    async with request.app.state.db.acquire() as conn:
+        servers = await server_store.list_servers(conn)
+    enabled = [s for s in servers if s.get("is_active")]
+    results = await xray_api.test_servers_parallel(enabled)
+    return {"status": "ok", "results": results}
+
+
 # ──────────── ПОЛЬЗОВАТЕЛИ ────────────
 @router.get("/api/users")
 async def api_users(request: Request, search: str = "", status: str = "all",
@@ -798,10 +810,12 @@ async function loadServers(){
   const box=document.getElementById('servers-list');
   if(!servers.length){box.innerHTML='<div class="text-gray-500 text-center py-8">Серверов нет. Добавьте первый.</div>';return;}
   box.innerHTML=servers.map(s=>{
-    const dot=s.is_active?'bg-green-500':'bg-gray-600', st=s.is_active?'Включён':'Выключен';
-    return `<div class="bg-gray-800 rounded-2xl p-4 border border-gray-700 flex items-center justify-between gap-3">
-      <div class="min-w-0"><div class="font-bold flex items-center gap-2"><span class="w-2.5 h-2.5 rounded-full ${dot}"></span> ${esc(s.name)} <span class="text-xs text-gray-500">${st}</span></div>
-      <div class="text-xs text-gray-400 mt-1 truncate">${esc(s.scheme)}://${esc(s.host)}:${s.port}/${esc(s.base_path)}</div></div>
+    const dot=s.is_active?'bg-yellow-500 animate-pulse':'bg-gray-600';
+    const st=s.is_active?'Проверяю…':'Выключен';
+    return `<div class="bg-gray-800 rounded-2xl p-4 border border-gray-700 flex items-center justify-between gap-3" data-server-id="${s.id}">
+      <div class="min-w-0"><div class="font-bold flex items-center gap-2"><span class="w-2.5 h-2.5 rounded-full ${dot}" data-dot></span> ${esc(s.name)} <span class="text-xs text-gray-500" data-status>${st}</span></div>
+      <div class="text-xs text-gray-400 mt-1 truncate">${esc(s.scheme)}://${esc(s.host)}:${s.port}/${esc(s.base_path)}</div>
+      <div class="text-xs mt-1 hidden" data-health></div></div>
       <div class="flex items-center gap-2 flex-shrink-0">
         <button onclick="testServerById(${s.id})" title="Проверить" class="bg-gray-700 hover:bg-gray-600 w-9 h-9 rounded-lg"><i class="fa-solid fa-plug-circle-check"></i></button>
         <button onclick="toggleServer(${s.id})" title="Вкл/выкл" class="bg-gray-700 hover:bg-gray-600 w-9 h-9 rounded-lg"><i class="fa-solid fa-power-off ${s.is_active?'text-green-400':'text-gray-500'}"></i></button>
@@ -809,6 +823,30 @@ async function loadServers(){
         <button onclick="deleteServer(${s.id})" title="Удалить" class="bg-red-600/20 text-red-400 hover:bg-red-600/30 w-9 h-9 rounded-lg"><i class="fa-solid fa-trash-can"></i></button>
       </div></div>`;
   }).join('');
+  refreshServersHealth();
+}
+async function refreshServersHealth(){
+  try{
+    const j=await(await fetch('/admin/api/servers/health')).json();
+    (j.results||[]).forEach(r=>{
+      const row=document.querySelector(`[data-server-id="${r.id}"]`); if(!row)return;
+      const dot=row.querySelector('[data-dot]'), status=row.querySelector('[data-status]'), health=row.querySelector('[data-health]');
+      dot.classList.remove('bg-yellow-500','animate-pulse','bg-gray-600','bg-green-500','bg-red-500');
+      if(r.ok){
+        dot.classList.add('bg-green-500');
+        status.innerText='Включён';
+        status.className='text-xs text-green-400';
+        health.classList.add('hidden');
+      }else{
+        dot.classList.add('bg-red-500');
+        status.innerText='ОШИБКА';
+        status.className='text-xs text-red-400 font-semibold';
+        health.classList.remove('hidden');
+        health.className='text-xs text-red-400 mt-1 break-all';
+        health.innerText=r.msg||'недоступен';
+      }
+    });
+  }catch(e){/* пусть остаётся жёлтый — пользователь увидит что чек не прошёл */}
 }
 function openServerModal(id){
   const s=id?servers.find(x=>x.id===id):null;

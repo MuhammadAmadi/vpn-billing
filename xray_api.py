@@ -1,5 +1,6 @@
 """Работа с 3x-ui панелями: добавление/обновление/удаление клиентов, сборка vless-ссылок."""
 
+import asyncio
 import json
 import logging
 import urllib.parse
@@ -375,3 +376,20 @@ async def test_server(server: dict) -> tuple[bool, str]:
             return True, f"OK — доступен, inbound'ов: {len(inbounds)}"
     except Exception as e:
         return False, f"Недоступен: {type(e).__name__}: {e}"
+
+
+async def test_servers_parallel(servers: list[dict]) -> list[dict]:
+    """Параллельно проверяет список серверов. Возвращает [{id, ok, msg}, ...]."""
+    if not servers:
+        return []
+    results = await asyncio.gather(
+        *(test_server(s) for s in servers), return_exceptions=True,
+    )
+    out = []
+    for s, r in zip(servers, results):
+        if isinstance(r, Exception):
+            ok, msg = False, f"{type(r).__name__}: {r}"
+        else:
+            ok, msg = r
+        out.append({"id": s.get("id"), "ok": ok, "msg": msg})
+    return out
