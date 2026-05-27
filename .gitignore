@@ -1,0 +1,45 @@
+# Бэкап файлы (все варианты)
+*.bak
+*.save
+*.backup
+*_backup
+
+# Базы данных
+*.db
+*.sqlite
+*.sqlite3
+
+# Файлы окружения
+.env
+.env.*
+
+# Временные файлы редакторов
+nano.*
+*.swp
+*.swo
+*~
+
+# Кэш Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Виртуальное окружение
+venv/
+env/
+.venv/
+virtualenv/
+
+# Логи
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.sublime-*
+
+# OS files
+.DS_Store
+Thumbs.db
