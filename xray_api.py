@@ -1,59 +1,83 @@
-import httpx
+"""Работа с 3x-ui панелями: добавление/обновление/удаление клиентов, сборка vless-ссылок."""
+
 import json
-import warnings
+import logging
 import urllib.parse
-import config
-from server_store import get_active_servers
-from error_log import log_error
+import warnings
+
+import httpx
+
 from bypass_store import get_active_bypass_ips
+from error_log import log_error
+from server_store import get_active_servers
 
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+log = logging.getLogger(__name__)
+
+HTTP_TIMEOUT = 10.0
+PRIVATE_MARK = "| PRIVATE"
+BYPASS_MARK = "BYPASS"
+PREMIUM_MARKS = ("| VIP", "| PRO")
 
 
-async def get_session_cookie(client: httpx.AsyncClient, server: dict):
-    base_url = f"{server['scheme']}://{server['host']}:{server['port']}/{server['base_path'].strip('/')}"
+def _base_url(server: dict) -> str:
+    return f"{server['scheme']}://{server['host']}:{server['port']}/{server['base_path'].strip('/')}"
+
+
+def _is_private(remark: str) -> bool:
+    return PRIVATE_MARK in remark.upper()
+
+
+def _is_premium(remark: str) -> bool:
+    upper = remark.upper()
+    return any(m in upper for m in PREMIUM_MARKS)
+
+
+def _skip_for_tariff(remark: str, tariff: str) -> bool:
+    if _is_private(remark):
+        return True
+    return tariff == "Standard" and _is_premium(remark)
+
+
+async def get_session_cookie(client: httpx.AsyncClient, server: dict) -> dict | None:
+    base_url = _base_url(server)
     try:
         resp = await client.post(
             f"{base_url}/login",
             json={"username": server["login"], "password": server["password"]},
-            timeout=10.0
+            timeout=HTTP_TIMEOUT,
         )
         if resp.status_code == 200 and resp.json().get("success"):
-            print(f"   🔑 Авторизация на {server['name']} успешна")
+            log.debug("Авторизация на %s успешна", server["name"])
             return dict(resp.cookies)
-        else:
-            print(f"   ❌ Авторизация не удалась: {resp.text[:100]}")
-            await log_error(
-                f"Авторизация не удалась (HTTP {resp.status_code})",
-                source="xray_api", server_name=server.get("name"),
-                level="error", details=resp.text[:500],
-            )
-            return None
+        log.warning("Авторизация на %s не удалась (HTTP %s)", server["name"], resp.status_code)
+        await log_error(
+            f"Авторизация не удалась (HTTP {resp.status_code})",
+            source="xray_api", server_name=server.get("name"),
+            level="error", details=resp.text[:500],
+        )
     except Exception as e:
-        print(f"   ❌ Ошибка авторизации на {server['name']}: {e}")
+        log.error("Ошибка авторизации на %s: %s", server["name"], e)
         await log_error(
             "Сервер недоступен (ошибка авторизации)",
             source="xray_api", server_name=server.get("name"),
             level="error", details=f"{type(e).__name__}: {e}",
         )
-        return None
+    return None
 
 
-def build_vless_link(client_uuid: str, email: str, server_host: str, inbound: dict, custom_name: str = None) -> str:
+def build_vless_link(client_uuid: str, email: str, server_host: str,
+                     inbound: dict, custom_name: str | None = None) -> str:
     port = inbound.get("port", 443)
     remark = inbound.get("remark", "").strip()
     stream = json.loads(inbound.get("streamSettings", "{}"))
 
-    # Проверяем External Proxy
     external_proxy = stream.get("externalProxy", [])
     if external_proxy:
         ep = external_proxy[0]
         server_host = ep.get("dest", server_host)
         port = ep.get("port", port)
-        if port == 443:
-            use_tls = True
-        else:
-            use_tls = False
+        use_tls = port == 443
     else:
         use_tls = False
 
@@ -77,7 +101,6 @@ def build_vless_link(client_uuid: str, email: str, server_host: str, inbound: di
         params["sni"] = server_names[0] if server_names else ""
         short_ids = reality.get("shortIds", [""])
         params["sid"] = short_ids[0] if short_ids else ""
-
     elif security == "tls":
         tls = stream.get("tlsSettings", {})
         params["sni"] = tls.get("serverName", "")
@@ -88,121 +111,140 @@ def build_vless_link(client_uuid: str, email: str, server_host: str, inbound: di
         params["path"] = xhttp.get("path", "/")
         host_val = xhttp.get("host", "").strip()
         params["host"] = host_val if host_val else server_host
-
     elif network == "ws":
         ws = stream.get("wsSettings", {})
         params["path"] = ws.get("path", "/")
         params["host"] = ws.get("headers", {}).get("Host", server_host)
-
     elif network == "grpc":
-        grpc = stream.get("grpcSettings", {})
-        params["serviceName"] = grpc.get("serviceName", "")
-
+        params["serviceName"] = stream.get("grpcSettings", {}).get("serviceName", "")
     elif network == "tcp":
-        tcp = stream.get("tcpSettings", {})
-        header = tcp.get("header", {})
+        header = stream.get("tcpSettings", {}).get("header", {})
         if header.get("type") == "http":
-            request = header.get("request", {})
-            paths = request.get("path", ["/"])
+            paths = header.get("request", {}).get("path", ["/"])
             params["path"] = paths[0] if paths else "/"
 
-    # Название: если есть remark — используем его, иначе название сервера
-    display_name = custom_name if custom_name else (remark if remark else "Server")
-    query = urllib.parse.urlencode(params)
-    name = urllib.parse.quote(display_name)
-    link = f"vless://{client_uuid}@{server_host}:{port}?{query}#{name}"
-    return link
+    display_name = custom_name or (remark if remark else "Server")
+    return (
+        f"vless://{client_uuid}@{server_host}:{port}"
+        f"?{urllib.parse.urlencode(params)}#{urllib.parse.quote(display_name)}"
+    )
 
 
-async def add_client_to_all_servers(client_uuid: str, email: str, tariff: str = "Standard"):
-    gathered_links = []
+def _client_payload(uuid: str, email: str) -> dict:
+    return {
+        "clients": [{
+            "id": uuid, "email": email,
+            "limitIp": 0, "totalGB": 0, "expiryTime": 0,
+            "enable": True, "flow": "xtls-rprx-vision",
+        }]
+    }
+
+
+def _resolve_bypass_host(remark: str, server_host: str,
+                         bypass_ips: list[str], counter: int) -> tuple[str, str | None, int]:
+    """Если inbound помечен как BYPASS — возвращает (адрес из списка, имя 'ОБХОД N', новый счётчик)."""
+    if BYPASS_MARK not in remark.upper():
+        return server_host, None, counter
+    host = bypass_ips[counter % len(bypass_ips)] if bypass_ips else server_host
+    return host, f"ОБХОД {counter + 1}", counter + 1
+
+
+async def _fetch_inbounds(client: httpx.AsyncClient, base_url: str,
+                          cookies: dict, server_name: str) -> list[dict]:
+    headers = {"Accept": "application/json"}
+    resp = await client.get(
+        f"{base_url}/panel/api/inbounds/list",
+        headers=headers, cookies=cookies, timeout=HTTP_TIMEOUT,
+    )
+    inbounds = resp.json().get("obj", [])
+    log.debug("%s: найдено %s inbound(ов)", server_name, len(inbounds))
+    return inbounds
+
+
+async def _add_client(client: httpx.AsyncClient, base_url: str, cookies: dict,
+                      inbound_id: int, uuid: str, email: str) -> bool:
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    payload = {"id": inbound_id, "settings": json.dumps(_client_payload(uuid, email))}
+    resp = await client.post(
+        f"{base_url}/panel/api/inbounds/addClient",
+        headers=headers, cookies=cookies, json=payload,
+    )
+    return resp.status_code == 200 and resp.json().get("success")
+
+
+async def add_client_to_all_servers(client_uuid: str, email: str,
+                                    tariff: str = "Standard") -> list[str]:
+    gathered_links: list[str] = []
     bypass_counter = 0
     bypass_ips = await get_active_bypass_ips()
     servers = await get_active_servers()
+
     async with httpx.AsyncClient(verify=False) as client:
         for server in servers:
-            base_url = f"{server['scheme']}://{server['host']}:{server['port']}/{server['base_path'].strip('/')}"
+            base_url = _base_url(server)
             cookies = await get_session_cookie(client, server)
             if not cookies:
-                print(f"❌ Пропускаем {server['name']} — нет авторизации")
+                log.warning("Пропускаю %s — нет авторизации", server["name"])
                 continue
-            headers = {"Accept": "application/json", "Content-Type": "application/json"}
             try:
-                resp = await client.get(f"{base_url}/panel/api/inbounds/list", headers=headers, cookies=cookies, timeout=10.0)
-                inbounds = resp.json().get("obj", [])
-                print(f"📋 {server['name']}: найдено {len(inbounds)} inbound(ов)")
+                inbounds = await _fetch_inbounds(client, base_url, cookies, server["name"])
                 for inbound in inbounds:
                     remark = inbound.get("remark", "")
-                    # Глобальный игнор приватных подключений
-                    if "| PRIVATE" in remark.upper():
-                        continue
-
-                    if tariff == "Standard" and ("| VIP" in remark.upper() or "| PRO" in remark.upper()):
+                    if _skip_for_tariff(remark, tariff):
                         continue
                     inbound_id = inbound.get("id")
                     unique_email = f"{email}_i{inbound_id}"
-                    print(f"   ➕ Добавляем в '{remark}' (id={inbound_id}), email={unique_email}")
-                    client_payload = {"clients": [{"id": client_uuid, "email": unique_email, "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": True, "flow": "xtls-rprx-vision"}]}
-                    add_payload = {"id": inbound_id, "settings": json.dumps(client_payload)}
-                    add_resp = await client.post(f"{base_url}/panel/api/inbounds/addClient", headers=headers, cookies=cookies, json=add_payload)
-                    add_result = add_resp.json()
-                    print(f"   📨 addClient: {add_resp.status_code} — {add_resp.text[:150]}")
-                    if add_resp.status_code == 200 and add_result.get("success"):
-                        # Проверяем, это BYPASS или нет
-                        if "BYPASS" in remark.upper():
-                            current_ip = bypass_ips[bypass_counter % len(bypass_ips)] if bypass_ips else server["host"]
-                            current_name = f"ОБХОД {bypass_counter + 1}"
-                            bypass_counter += 1
-                        else:
-                            current_ip = server["host"]
-                            current_name = None
-
-                        link = build_vless_link(client_uuid, unique_email, current_ip, inbound, current_name)
-                        print(f"   ✅ Ссылка собрана: {link[:80]}...")
-                        gathered_links.append(link)
-                    else:
+                    if not await _add_client(client, base_url, cookies, inbound_id,
+                                             client_uuid, unique_email):
                         await log_error(
-                            f"addClient вернул ошибку (HTTP {add_resp.status_code})",
+                            "addClient вернул ошибку",
                             source="xray_api", server_name=server.get("name"),
-                            level="warning", details=add_resp.text[:500],
+                            level="warning", details=f"inbound={inbound_id}",
                         )
+                        continue
+                    host, custom_name, bypass_counter = _resolve_bypass_host(
+                        remark, server["host"], bypass_ips, bypass_counter,
+                    )
+                    link = build_vless_link(client_uuid, unique_email, host, inbound, custom_name)
+                    gathered_links.append(link)
             except Exception as e:
-                print(f"❌ Ошибка Xray на {server['name']}: {e}")
+                log.error("Ошибка Xray на %s: %s", server["name"], e)
                 await log_error(
                     "Ошибка при добавлении клиента",
                     source="xray_api", server_name=server.get("name"),
                     level="error", details=f"{type(e).__name__}: {e}",
                 )
-    print(f"🏁 Итого собрано ссылок: {len(gathered_links)}")
+
+    log.info("Собрано ссылок: %s", len(gathered_links))
     return gathered_links
 
 
-async def remove_client_from_all_servers(client_uuid: str):
+async def remove_client_from_all_servers(client_uuid: str) -> None:
     servers = await get_active_servers()
     async with httpx.AsyncClient(verify=False) as client:
         for server in servers:
-            base_url = f"{server['scheme']}://{server['host']}:{server['port']}/{server['base_path'].strip('/')}"
+            base_url = _base_url(server)
             cookies = await get_session_cookie(client, server)
             if not cookies:
                 continue
-            headers = {"Accept": "application/json"}
             try:
-                resp = await client.get(f"{base_url}/panel/api/inbounds/list", headers=headers, cookies=cookies, timeout=10.0)
-                inbounds = resp.json().get("obj", [])
+                inbounds = await _fetch_inbounds(client, base_url, cookies, server["name"])
                 for inbound in inbounds:
                     inbound_id = inbound["id"]
-                    client_stats = inbound.get("clientStats", [])
-                    real_uuid = None
-                    for stat in client_stats:
-                        if stat.get("uuid") == client_uuid:
-                            real_uuid = stat.get("uuid")
-                            break
+                    real_uuid = next(
+                        (s.get("uuid") for s in inbound.get("clientStats", [])
+                         if s.get("uuid") == client_uuid),
+                        None,
+                    )
                     if not real_uuid:
                         continue
-                    del_resp = await client.post(f"{base_url}/panel/api/inbounds/{inbound_id}/delClient/{real_uuid}", headers=headers, cookies=cookies)
-                    print(f"   🗑️ delClient {server['name']} inbound={inbound_id}: {del_resp.status_code}")
+                    await client.post(
+                        f"{base_url}/panel/api/inbounds/{inbound_id}/delClient/{real_uuid}",
+                        headers={"Accept": "application/json"}, cookies=cookies,
+                    )
+                    log.debug("delClient %s inbound=%s", server["name"], inbound_id)
             except Exception as e:
-                print(f"❌ Ошибка удаления Xray на {server['name']}: {e}")
+                log.error("Ошибка удаления Xray на %s: %s", server["name"], e)
                 await log_error(
                     "Ошибка при удалении клиента",
                     source="xray_api", server_name=server.get("name"),
@@ -210,48 +252,45 @@ async def remove_client_from_all_servers(client_uuid: str):
                 )
 
 
-async def update_client_uuid_on_all_servers(old_uuid: str, new_uuid: str, email: str):
+async def update_client_uuid_on_all_servers(old_uuid: str, new_uuid: str, email: str) -> None:
     servers = await get_active_servers()
     async with httpx.AsyncClient(verify=False) as client:
         for server in servers:
-            base_url = f"{server['scheme']}://{server['host']}:{server['port']}/{server['base_path'].strip('/')}"
+            base_url = _base_url(server)
             cookies = await get_session_cookie(client, server)
             if not cookies:
                 continue
             headers = {"Accept": "application/json", "Content-Type": "application/json"}
             try:
-                resp = await client.get(f"{base_url}/panel/api/inbounds/list", headers=headers, cookies=cookies, timeout=10.0)
-                inbounds = resp.json().get("obj", [])
+                inbounds = await _fetch_inbounds(client, base_url, cookies, server["name"])
                 for inbound in inbounds:
                     remark = inbound.get("remark", "")
-                    # Глобальный игнор приватных подключений
-                    if "| PRIVATE" in remark.upper():
-                        continue
-
-                    if "| VIP" in remark.upper() or "| PRO" in remark.upper():
+                    if _is_private(remark) or _is_premium(remark):
                         continue
                     inbound_id = inbound["id"]
                     unique_email = f"{email}_i{inbound_id}"
-                    client_stats = inbound.get("clientStats", [])
-                    real_uuid = None
-                    for stat in client_stats:
-                        if stat.get("email") == unique_email:
-                            real_uuid = stat.get("uuid")
-                            break
+                    real_uuid = next(
+                        (s.get("uuid") for s in inbound.get("clientStats", [])
+                         if s.get("email") == unique_email),
+                        None,
+                    )
+                    payload = {"id": inbound_id, "settings": json.dumps(_client_payload(new_uuid, unique_email))}
                     if not real_uuid:
-                        print(f"   ⚠️ {unique_email} не найден, добавляем заново...")
-                        client_payload = {"clients": [{"id": new_uuid, "email": unique_email, "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": True, "flow": "xtls-rprx-vision"}]}
-                        add_payload = {"id": inbound_id, "settings": json.dumps(client_payload)}
-                        add_resp = await client.post(f"{base_url}/panel/api/inbounds/addClient", headers=headers, cookies=cookies, json=add_payload)
-                        print(f"   ➕ addClient: {add_resp.status_code} {add_resp.text[:100]}")
+                        log.info("%s: %s не найден, добавляю заново", server["name"], unique_email)
+                        await client.post(
+                            f"{base_url}/panel/api/inbounds/addClient",
+                            headers=headers, cookies=cookies, json=payload,
+                        )
                         continue
-                    print(f"   📤 Обновляем {server['name']} inbound={inbound_id}: {real_uuid} → {new_uuid}")
-                    client_payload = {"clients": [{"id": new_uuid, "email": unique_email, "limitIp": 0, "totalGB": 0, "expiryTime": 0, "enable": True, "flow": "xtls-rprx-vision"}]}
-                    upd_payload = {"id": inbound_id, "settings": json.dumps(client_payload)}
-                    upd_resp = await client.post(f"{base_url}/panel/api/inbounds/updateClient/{real_uuid}", headers=headers, cookies=cookies, data=json.dumps(upd_payload), timeout=10.0)
-                    print(f"   🔄 updateClient: {upd_resp.status_code} {upd_resp.text[:100]}")
+                    await client.post(
+                        f"{base_url}/panel/api/inbounds/updateClient/{real_uuid}",
+                        headers=headers, cookies=cookies,
+                        data=json.dumps(payload), timeout=HTTP_TIMEOUT,
+                    )
+                    log.debug("updateClient %s inbound=%s: %s → %s",
+                              server["name"], inbound_id, real_uuid, new_uuid)
             except Exception as e:
-                print(f"❌ Ошибка updateClient на {server['name']}: {e}")
+                log.error("Ошибка updateClient на %s: %s", server["name"], e)
                 await log_error(
                     "Ошибка при обновлении ключа клиента",
                     source="xray_api", server_name=server.get("name"),
@@ -259,116 +298,78 @@ async def update_client_uuid_on_all_servers(old_uuid: str, new_uuid: str, email:
                 )
 
 
-async def get_client_links_from_all_servers(client_uuid: str, email: str, tariff: str = "Standard"):
-    gathered_links = []
+async def get_client_links_from_all_servers(client_uuid: str, email: str,
+                                            tariff: str = "Standard") -> list[str]:
+    gathered_links: list[str] = []
     bypass_counter = 0
     bypass_ips = await get_active_bypass_ips()
     servers = await get_active_servers()
+
     async with httpx.AsyncClient(verify=False) as client:
         for server in servers:
-            base_url = f"{server['scheme']}://{server['host']}:{server['port']}/{server['base_path'].strip('/')}"
+            base_url = _base_url(server)
             cookies = await get_session_cookie(client, server)
             if not cookies:
                 continue
-            headers = {"Accept": "application/json"}
             try:
-                resp = await client.get(f"{base_url}/panel/api/inbounds/list", headers=headers, cookies=cookies, timeout=10.0)
-                inbounds = resp.json().get("obj", [])
+                inbounds = await _fetch_inbounds(client, base_url, cookies, server["name"])
                 for inbound in inbounds:
                     remark = inbound.get("remark", "")
-                    # Глобальный игнор приватных подключений
-                    if "| PRIVATE" in remark.upper():
-                        continue
-
-                    if tariff == "Standard" and ("| VIP" in remark.upper() or "| PRO" in remark.upper()):
+                    if _skip_for_tariff(remark, tariff):
                         continue
                     inbound_id = inbound["id"]
                     unique_email = f"{email}_i{inbound_id}"
                     settings = json.loads(inbound.get("settings", "{}"))
                     clients = settings.get("clients", [])
-                    client_uuid_real = next((c.get("id") for c in clients if c.get("email") == unique_email), None)
+                    real_uuid = next(
+                        (c.get("id") for c in clients if c.get("email") == unique_email),
+                        None,
+                    )
 
-                    # Если клиента нет на сервере — добавляем его на лету
-                    if not client_uuid_real:
-                        print(f"   ⚠️ Клиент {unique_email} не найден на {server['name']}, добавляем...")
-                        client_payload = {
-                            "clients": [{
-                                "id": client_uuid,
-                                "email": unique_email,
-                                "limitIp": 0,
-                                "totalGB": 0,
-                                "expiryTime": 0,
-                                "enable": True,
-                                "flow": "xtls-rprx-vision"
-                            }]
-                        }
-                        add_payload = {"id": inbound_id, "settings": json.dumps(client_payload)}
-                        try:
-                            add_resp = await client.post(
-                                f"{base_url}/panel/api/inbounds/addClient",
-                                headers=headers,
-                                cookies=cookies,
-                                json=add_payload
-                            )
-                            if add_resp.status_code == 200 and add_resp.json().get("success"):
-                                print(f"   ➕ Клиент успешно добавлен на лету!")
-                                client_uuid_real = client_uuid
-                            else:
-                                print(f"   ❌ Ошибка авто-добавления: {add_resp.text[:100]}")
-                                await log_error(
-                                    f"Авто-добавление клиента не удалось (HTTP {add_resp.status_code})",
-                                    source="xray_api", server_name=server.get("name"),
-                                    level="warning", details=add_resp.text[:500],
-                                )
-                                continue
-                        except Exception as e:
-                            print(f"   ❌ Сетевая ошибка при авто-добавлении: {e}")
+                    if not real_uuid:
+                        log.info("%s: %s не найден на сервере, добавляю", server["name"], unique_email)
+                        if not await _add_client(client, base_url, cookies, inbound_id,
+                                                 client_uuid, unique_email):
                             await log_error(
-                                "Сетевая ошибка при авто-добавлении клиента",
+                                "Авто-добавление клиента не удалось",
                                 source="xray_api", server_name=server.get("name"),
-                                level="error", details=f"{type(e).__name__}: {e}",
+                                level="warning", details=f"inbound={inbound_id}",
                             )
                             continue
+                        real_uuid = client_uuid
 
-                        # Проверяем, это BYPASS или нет
-                    if "BYPASS" in remark.upper():
-                        current_ip = bypass_ips[bypass_counter % len(bypass_ips)] if bypass_ips else server["host"]
-                        current_name = f"ОБХОД {bypass_counter + 1}"
-                        bypass_counter += 1
-                    else:
-                        current_ip = server["host"]
-                        current_name = None
-
-                    link = build_vless_link(client_uuid, unique_email, current_ip, inbound, current_name)
-                    print(f"   🔗 {server['name']} inbound={inbound_id}: ссылка собрана")
+                    host, custom_name, bypass_counter = _resolve_bypass_host(
+                        remark, server["host"], bypass_ips, bypass_counter,
+                    )
+                    link = build_vless_link(client_uuid, unique_email, host, inbound, custom_name)
                     gathered_links.append(link)
             except Exception as e:
-                print(f"❌ Ошибка getLinks на {server['name']}: {e}")
+                log.error("Ошибка getLinks на %s: %s", server["name"], e)
                 await log_error(
                     "Ошибка при получении ссылок",
                     source="xray_api", server_name=server.get("name"),
                     level="error", details=f"{type(e).__name__}: {e}",
                 )
+
     return gathered_links
 
 
-# === Проверка одного сервера (используется кнопкой "Тест" в админ-панели) ===
-async def test_server(server: dict):
-    """Пробует залогиниться и получить список inbound'ов. Возвращает (ok, message)."""
-    base_url = f"{server['scheme']}://{server['host']}:{server['port']}/{server['base_path'].strip('/')}"
+async def test_server(server: dict) -> tuple[bool, str]:
+    """Залогиниться и получить inbound'ы — для кнопки 'Тест' в админ-панели."""
+    base_url = _base_url(server)
     try:
         async with httpx.AsyncClient(verify=False) as client:
             resp = await client.post(
                 f"{base_url}/login",
                 json={"username": server["login"], "password": server["password"]},
-                timeout=10.0,
+                timeout=HTTP_TIMEOUT,
             )
             if resp.status_code != 200 or not resp.json().get("success"):
                 return False, f"Авторизация не удалась (HTTP {resp.status_code})"
             cookies = dict(resp.cookies)
             lst = await client.get(
                 f"{base_url}/panel/api/inbounds/list",
-                headers={"Accept": "application/json"}, cookies=cookies, timeout=10.0,
+                headers={"Accept": "application/json"}, cookies=cookies, timeout=HTTP_TIMEOUT,
             )
             inbounds = lst.json().get("obj", [])
             return True, f"OK — доступен, inbound'ов: {len(inbounds)}"

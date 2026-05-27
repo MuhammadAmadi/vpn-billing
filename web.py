@@ -1,71 +1,87 @@
+"""Веб-сервер личного кабинета + API устройств + сервер подписок (/sub/{id})."""
+
+import base64
+import json
+import logging
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-import asyncpg
-from contextlib import asynccontextmanager
+
 import config
+import db
 import xray_api
-import json
-import uuid
-import base64
 from admin_panel import router as admin_router
+
+logging.basicConfig(level=config.LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+log = logging.getLogger("web")
+
+ROUTING_PATH = Path(__file__).resolve().parent / "routing.json"
+SUB_REFRESH_SECONDS = 3600  # как часто обновлять ссылки в кэше /sub
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("🔄 Веб-сервер подключается к БД...")
-    app.state.db = await asyncpg.create_pool(
-        user=config.DB_USER, password=config.DB_PASS, database=config.DB_NAME, host=config.DB_HOST
-    )
-    yield
-    await app.state.db.close()
+    log.info("Веб-сервер подключается к БД...")
+    app.state.db = await db.create_pool()
+    try:
+        yield
+    finally:
+        await app.state.db.close()
+
 
 app = FastAPI(title="SihaVPN Cabinet", lifespan=lifespan)
 app.include_router(admin_router)
+
 
 class DeviceCreate(BaseModel):
     token: str
     os: str
     name: str
 
+
 class DeviceManage(BaseModel):
     token: str
     device_id: str
     new_name: str = ""
 
-# === ИНТЕГРИРОВАННЫЙ СЕРВЕР ПОДПИСОК (Замена sub_server.py) ===
+
+# ─── /sub/{id} — сервер подписок (заменяет старый sub_server.py) ───
 @app.get("/sub/{device_id}")
 async def get_subscription(request: Request, device_id: str):
     async with app.state.db.acquire() as conn:
-        device = await conn.fetchrow(
-            '''SELECT d.id, d.short_id, d.name, d.user_id, d.key_string,
-               d.links_updated_at, u.balance,
-               (SELECT COUNT(*) FROM devices WHERE user_id = d.user_id) as device_count
-               FROM devices d JOIN users u ON u.user_id = d.user_id WHERE d.id = $1''',
-            device_id
-        )
+        device = await conn.fetchrow("""
+            SELECT d.id, d.short_id, d.name, d.user_id, d.key_string,
+                   d.links_updated_at, u.balance,
+                   (SELECT COUNT(*) FROM devices WHERE user_id = d.user_id) AS device_count
+            FROM devices d JOIN users u ON u.user_id = d.user_id
+            WHERE d.id = $1
+        """, device_id)
 
     if not device:
         return Response(content="User not found", status_code=404)
 
-    balance = float(device['balance'])
-    device_count = max(int(device['device_count']), 1)
-    if balance < device_count * 3.33:
+    balance = float(device["balance"])
+    device_count = max(int(device["device_count"]), 1)
+    if balance < device_count * config.PRICE_PER_DEVICE:
         return Response(content="Subscription inactive", status_code=403)
 
-    user_id = device['user_id']
-    short_id = device['short_id']
+    user_id = device["user_id"]
+    short_id = device["short_id"]
     email = f"user{user_id}_{short_id}"
-    links_text = device['key_string']
+    links_text = device["key_string"]
 
-    # Обновляем ссылки не чаще раза в час
-    from datetime import datetime, timezone
+    last_update = device["links_updated_at"]
     now = datetime.now(timezone.utc)
-    last_update = device['links_updated_at']
     need_refresh = (
         not links_text or
         not last_update or
-        (now - last_update.replace(tzinfo=timezone.utc)).total_seconds() > 3600
+        (now - last_update.replace(tzinfo=timezone.utc)).total_seconds() > SUB_REFRESH_SECONDS
     )
 
     if need_refresh:
@@ -74,101 +90,129 @@ async def get_subscription(request: Request, device_id: str):
             links_text = "\n".join(raw_links)
             async with app.state.db.acquire() as conn:
                 await conn.execute(
-                    'UPDATE devices SET key_string = $1, links_updated_at = NOW() WHERE id = $2',
-                    links_text, device_id
+                    "UPDATE devices SET key_string = $1, links_updated_at = NOW() WHERE id = $2",
+                    links_text, device_id,
                 )
-            print(f"🔄 Ссылки обновлены для {short_id}")
+            log.info("Ссылки обновлены для %s", short_id)
         else:
-            print(f"⚠️ Не удалось обновить ссылки для {short_id}, используем кэш")
+            log.warning("Не удалось обновить ссылки для %s, использую кэш", short_id)
 
     if not links_text:
         return Response(content="No links available", status_code=404)
 
-    encoded_links = base64.b64encode(links_text.encode('utf-8')).decode('utf-8')
+    encoded_links = base64.b64encode(links_text.encode("utf-8")).decode("utf-8")
     headers = {
         "Content-Type": "text/plain; charset=utf-8",
         "profile-title": "SihaVPN",
         "profile-update-interval": "24",
-        "Content-Disposition": "attachment; filename=sub.txt"
+        "Content-Disposition": "attachment; filename=sub.txt",
     }
 
-    user_agent = request.headers.get('user-agent', '').lower()
-    if 'happ' in user_agent:
+    user_agent = request.headers.get("user-agent", "").lower()
+    if "happ" in user_agent:
         try:
-            with open('routing.json', 'r', encoding='utf-8') as f:
+            with open(ROUTING_PATH, "r", encoding="utf-8") as f:
                 routing_json = json.load(f)
-            routing_b64 = base64.b64encode(json.dumps(routing_json).encode('utf-8')).decode('utf-8')
+            routing_b64 = base64.b64encode(json.dumps(routing_json).encode("utf-8")).decode("utf-8")
             headers["routing"] = f"happ://routing/onadd/{routing_b64}"
         except Exception as e:
-            print(f"⚠️ Ошибка routing.json: {e}")
+            log.warning("Ошибка чтения routing.json: %s", e)
 
     return Response(content=encoded_links, headers=headers)
 
-# === API МЕТОДЫ ЛИЧНОГО КАБИНЕТА ===
+
+# ─── API кабинета ───
 @app.post("/api/device/add")
 async def add_device(data: DeviceCreate):
     try:
         async with app.state.db.acquire() as conn:
-            user = await conn.fetchrow('SELECT user_id, balance FROM users WHERE magic_token = $1', data.token)
-            if not user: return {"status": "error", "msg": "Пользователь не найден"}
+            user = await conn.fetchrow(
+                "SELECT user_id, balance FROM users WHERE magic_token = $1", data.token,
+            )
+            if not user:
+                return {"status": "error", "msg": "Пользователь не найден"}
+            user_id = user["user_id"]
+            devices_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM devices WHERE user_id = $1", user_id,
+            )
+            required_balance = (devices_count + 1) * config.PRICE_PER_DEVICE
+            if float(user["balance"]) < required_balance:
+                return {"status": "error",
+                        "msg": f"Для {devices_count + 1} устройств нужен баланс минимум {required_balance:.2f}₽"}
 
-            user_id = user['user_id']
-            devices_count = await conn.fetchval('SELECT COUNT(*) FROM devices WHERE user_id = $1', user_id)
-
-            required_balance = (devices_count + 1) * 3.33
-            if float(user['balance']) < required_balance:
-                return {"status": "error", "msg": f"Для {devices_count + 1} устройств нужен баланс минимум {required_balance:.2f}₽"}
-
-            # ГЕНЕРАЦИЯ РЕАЛЬНЫХ КЛЮЧЕЙ И КОРОТКОГО ID
-            device_id = str(uuid.uuid4()) # Длинный UUID для Xray (36 символов)
-            short_id = str(uuid.uuid4().hex)[:4].upper() # Красивый короткий ID (4 символа)
+            device_id = str(uuid.uuid4())
+            short_id = uuid.uuid4().hex[:4].upper()
             device_email = f"user{user_id}_{short_id}"
-            
+
             raw_links = await xray_api.add_client_to_all_servers(device_id, device_email)
             if not raw_links:
                 return {"status": "error", "msg": "Ошибка связи с VPN серверами. Попробуйте позже."}
-                
+
             links_text = "\n".join(raw_links)
             sub_url = f"{config.CABINET_BASE_URL}/sub/{device_id}"
 
-            await conn.execute('''INSERT INTO devices (id, short_id, user_id, name, os, key_string) VALUES ($1, $2, $3, $4, $5, $6)''',
-                               device_id, short_id, user_id, data.name, data.os, links_text)
-            await conn.execute('''INSERT INTO transactions (user_id, type, title, description) VALUES ($1, 'action', 'Добавлено устройство', $2)''',
-                               user_id, f"ID {short_id} {data.name} ({data.os})")
-            
+            async with conn.transaction():
+                await conn.execute(
+                    """INSERT INTO devices (id, short_id, user_id, name, os, key_string)
+                       VALUES ($1, $2, $3, $4, $5, $6)""",
+                    device_id, short_id, user_id, data.name, data.os, links_text,
+                )
+                await conn.execute(
+                    """INSERT INTO transactions (user_id, type, title, description)
+                       VALUES ($1, 'action', 'Добавлено устройство', $2)""",
+                    user_id, f"ID {short_id} {data.name} ({data.os})",
+                )
         return {"status": "ok", "key": sub_url}
     except Exception as e:
+        log.exception("add_device failed")
         return {"status": "error", "msg": str(e)}
+
 
 @app.post("/api/device/delete")
 async def delete_device(data: DeviceManage):
     try:
         async with app.state.db.acquire() as conn:
-            user_id = await conn.fetchval('SELECT user_id FROM users WHERE magic_token = $1', data.token)
-            if user_id:
-                # 1. Удаляем с реальных VPN серверов
-                await xray_api.remove_client_from_all_servers(data.device_id)
-                # 2. Удаляем из БД
-                await conn.execute('DELETE FROM devices WHERE id = $1 AND user_id = $2', data.device_id, user_id)
-                await conn.execute('''INSERT INTO transactions (user_id, type, title, description) VALUES ($1, 'action', 'Удалено устройство', $2)''',
-                                   user_id, "Устройство удалено")
+            user_id = await conn.fetchval(
+                "SELECT user_id FROM users WHERE magic_token = $1", data.token,
+            )
+            if not user_id:
+                return {"status": "ok"}
+            await xray_api.remove_client_from_all_servers(data.device_id)
+            async with conn.transaction():
+                await conn.execute(
+                    "DELETE FROM devices WHERE id = $1 AND user_id = $2",
+                    data.device_id, user_id,
+                )
+                await conn.execute(
+                    """INSERT INTO transactions (user_id, type, title, description)
+                       VALUES ($1, 'action', 'Удалено устройство', $2)""",
+                    user_id, "Устройство удалено",
+                )
         return {"status": "ok"}
     except Exception as e:
+        log.exception("delete_device failed")
         return {"status": "error", "msg": str(e)}
+
 
 @app.post("/api/device/update_key")
 async def update_device_key(data: DeviceManage):
     try:
-        print(f"🔄 update_key вызван: token={data.token[:8]}... device_id={data.device_id}")
+        log.info("update_key вызван: device_id=%s", data.device_id)
         async with app.state.db.acquire() as conn:
-            user = await conn.fetchrow('SELECT user_id FROM users WHERE magic_token = $1', data.token)
-            if not user: return {"status": "error", "msg": "Пользователь не найден"}
-            user_id = user['user_id']
+            user = await conn.fetchrow(
+                "SELECT user_id FROM users WHERE magic_token = $1", data.token,
+            )
+            if not user:
+                return {"status": "error", "msg": "Пользователь не найден"}
+            user_id = user["user_id"]
 
-            # Получаем короткий ID, чтобы он остался прежним
-            device_row = await conn.fetchrow('SELECT short_id FROM devices WHERE id = $1 AND user_id = $2', data.device_id, user_id)
-            if not device_row: return {"status": "error", "msg": "Устройство не найдено"}
-            short_id = device_row['short_id']
+            device_row = await conn.fetchrow(
+                "SELECT short_id FROM devices WHERE id = $1 AND user_id = $2",
+                data.device_id, user_id,
+            )
+            if not device_row:
+                return {"status": "error", "msg": "Устройство не найдено"}
+            short_id = device_row["short_id"]
 
             new_device_id = str(uuid.uuid4())
             new_email = f"user{user_id}_{short_id}"
@@ -177,56 +221,100 @@ async def update_device_key(data: DeviceManage):
 
             if not raw_links:
                 return {"status": "error", "msg": "Ошибка связи с VPN серверами."}
-            
+
             links_text = "\n".join(raw_links)
             sub_url = f"{config.CABINET_BASE_URL}/sub/{new_device_id}"
 
-            # 3. Обновляем длинный ID и ссылки в базе
-            await conn.execute('UPDATE devices SET id = $1, key_string = $2 WHERE id = $3 AND user_id = $4', 
-                               new_device_id, links_text, data.device_id, user_id)
-            await conn.execute('''INSERT INTO transactions (user_id, type, title, description) VALUES ($1, 'action', 'Обновлен ключ', $2)''',
-                               user_id, f"ID {short_id}")
-
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE devices SET id = $1, key_string = $2 WHERE id = $3 AND user_id = $4",
+                    new_device_id, links_text, data.device_id, user_id,
+                )
+                await conn.execute(
+                    """INSERT INTO transactions (user_id, type, title, description)
+                       VALUES ($1, 'action', 'Обновлен ключ', $2)""",
+                    user_id, f"ID {short_id}",
+                )
         return {"status": "ok", "new_key": sub_url}
     except Exception as e:
+        log.exception("update_device_key failed")
         return {"status": "error", "msg": str(e)}
+
 
 @app.post("/api/device/rename")
 async def rename_device(data: DeviceManage):
     try:
         async with app.state.db.acquire() as conn:
-            user_id = await conn.fetchval('SELECT user_id FROM users WHERE magic_token = $1', data.token)
+            user_id = await conn.fetchval(
+                "SELECT user_id FROM users WHERE magic_token = $1", data.token,
+            )
             if user_id:
-                await conn.execute('UPDATE devices SET name = $1 WHERE id = $2 AND user_id = $3', data.new_name, data.device_id, user_id)
+                await conn.execute(
+                    "UPDATE devices SET name = $1 WHERE id = $2 AND user_id = $3",
+                    data.new_name, data.device_id, user_id,
+                )
         return {"status": "ok"}
     except Exception as e:
+        log.exception("rename_device failed")
         return {"status": "error", "msg": str(e)}
+
 
 @app.get("/cabinet/{token}", response_class=HTMLResponse)
 async def open_cabinet(token: str):
     async with app.state.db.acquire() as conn:
-        user = await conn.fetchrow('SELECT * FROM users WHERE magic_token = $1', token)
-        if not user: return HTMLResponse("<h1 style='color:white; text-align:center; margin-top:50px; font-family:sans-serif;'>❌ Ссылка устарела.</h1>", status_code=404)
+        user = await conn.fetchrow("SELECT * FROM users WHERE magic_token = $1", token)
+        if not user:
+            return HTMLResponse(
+                "<h1 style='color:white; text-align:center; margin-top:50px; font-family:sans-serif;'>❌ Ссылка устарела.</h1>",
+                status_code=404,
+            )
 
-        user_id = user['user_id']
-        balance = float(user['balance'])
+        user_id = user["user_id"]
+        balance = float(user["balance"])
 
-        db_devices = await conn.fetch('''SELECT id, short_id, name, os, TO_CHAR(created_at, 'DD.MM.YY') as date, CAST(extract(epoch from created_at)*1000 AS BIGINT) as timestamp FROM devices WHERE user_id = $1 ORDER BY created_at DESC''', user_id)
+        db_devices = await conn.fetch("""
+            SELECT id, short_id, name, os,
+                   TO_CHAR(created_at, 'DD.MM.YY') AS date,
+                   CAST(extract(epoch from created_at)*1000 AS BIGINT) AS timestamp
+            FROM devices WHERE user_id = $1 ORDER BY created_at DESC
+        """, user_id)
         devices_list = [dict(d) for d in db_devices]
 
-        devices_count = len(devices_list) if len(devices_list) > 0 else 1
-        daily_cost = devices_count * 3.33
+        devices_count = len(devices_list) if devices_list else 1
+        daily_cost = devices_count * config.PRICE_PER_DEVICE
         days_left = int(balance // daily_cost) if balance >= daily_cost else 0
 
-        if balance >= daily_cost:
-            header_status = '<div class="bg-gray-800 px-3 py-1 rounded-full text-sm text-green-400 border border-green-500/30"><i class="fa-solid fa-circle-check mr-1"></i> Активен</div>'
-        else:
-            header_status = '<div class="bg-gray-800 px-3 py-1 rounded-full text-sm text-red-400 border border-red-500/30"><i class="fa-solid fa-circle-xmark mr-1"></i> Остановлен</div>'
+        is_active = balance >= daily_cost
+        header_status = _render_status_badge(is_active)
 
-        db_history = await conn.fetch('''SELECT type, title, description as desc, amount, CASE WHEN created_at::date = CURRENT_DATE THEN 'Сегодня' ELSE TO_CHAR(created_at, 'DD.MM.YY') END as date, TO_CHAR(created_at, 'HH24:MI') as time FROM transactions WHERE user_id = $1 ORDER BY created_at DESC''', user_id)
+        db_history = await conn.fetch("""
+            SELECT type, title, description AS desc, amount,
+                   CASE WHEN created_at::date = CURRENT_DATE THEN 'Сегодня'
+                        ELSE TO_CHAR(created_at, 'DD.MM.YY') END AS date,
+                   TO_CHAR(created_at, 'HH24:MI') AS time
+            FROM transactions WHERE user_id = $1 ORDER BY created_at DESC
+        """, user_id)
         history_list = [dict(h) for h in db_history]
 
-    html_content = f"""
+    return HTMLResponse(_render_cabinet(
+        token=token, user_id=user_id, balance=balance, days_left=days_left,
+        header_status=header_status, devices_list=devices_list, history_list=history_list,
+        ref_url=config.REFERRAL_URL_TEMPLATE.format(user_id=user_id),
+        price=config.PRICE_PER_DEVICE,
+    ))
+
+
+def _render_status_badge(is_active: bool) -> str:
+    if is_active:
+        return ('<div class="bg-gray-800 px-3 py-1 rounded-full text-sm text-green-400 border border-green-500/30">'
+                '<i class="fa-solid fa-circle-check mr-1"></i> Активен</div>')
+    return ('<div class="bg-gray-800 px-3 py-1 rounded-full text-sm text-red-400 border border-red-500/30">'
+            '<i class="fa-solid fa-circle-xmark mr-1"></i> Остановлен</div>')
+
+
+def _render_cabinet(*, token, user_id, balance, days_left, header_status,
+                    devices_list, history_list, ref_url, price) -> str:
+    return f"""
     <!DOCTYPE html>
     <html lang="ru">
     <head>
@@ -265,16 +353,15 @@ async def open_cabinet(token: str):
             <div id="device-list" class="space-y-3"></div>
             <div id="empty-state" class="hidden text-center py-8 bg-gray-800/50 rounded-2xl border border-gray-700/50 border-dashed"><i class="fa-solid fa-mobile-screen text-4xl text-gray-600 mb-3"></i><p class="text-gray-400">Устройств пока нет</p></div>
 
-        <!-- Реферальная ссылка напрямую -->
             <div class="bg-gray-800 rounded-2xl p-4 mt-8 shadow-lg border border-gray-700">
                 <p class="text-xs text-gray-400 mb-2">Ваша реферальная ссылка (3% с пополнений):</p>
                 <div class="flex items-center gap-2 bg-gray-900 p-2 rounded-xl border border-gray-600">
-                    <input type="text" readonly value="https://t.me/SihaVPN_bot?start={user_id}" class="w-full bg-transparent text-purple-400 text-xs outline-none select-all" id="ref-link-input">
+                    <input type="text" readonly value="{ref_url}" class="w-full bg-transparent text-purple-400 text-xs outline-none select-all" id="ref-link-input">
                     <button onclick="copyRefFromInput()" class="bg-gray-700 hover:bg-gray-600 text-white px-3 py-1.5 rounded-lg text-xs transition"><i class="fa-regular fa-copy"></i></button>
                 </div>
             </div>
 
-         </div>
+        </div>
 
         <div id="backdrop" class="hidden fixed inset-0 bg-black/80 backdrop-blur-sm z-40 transition-opacity"></div>
 
@@ -341,6 +428,7 @@ async def open_cabinet(token: str):
         <script>
             const CABINET_TOKEN = "{token}";
             const userBalance = {balance};
+            const PRICE_PER_DEVICE = {price};
             let devices = {json.dumps(devices_list, ensure_ascii=False)};
             const userHistory = {json.dumps(history_list, ensure_ascii=False)};
             let currentHistoryFilter = 'transactions';
@@ -359,11 +447,11 @@ async def open_cabinet(token: str):
                     list.innerHTML = devices.map((d, index) => {{
                         let icon = d.os === "Android" ? "fa-android text-green-400" : d.os === "iOS" ? "fa-apple text-gray-200" : "fa-windows text-blue-400";
                         let statusHtml = '';
-                        if (userBalance < 3.33) {{
+                        if (userBalance < PRICE_PER_DEVICE) {{
                             statusHtml = '<span class="text-[9px] bg-red-500/20 text-red-400 px-2 py-0.5 rounded border border-red-500/30 ml-2 uppercase font-bold tracking-wider">Нехватка средств</span>';
                             icon = icon.replace('text-green-400', 'text-gray-500').replace('text-blue-400', 'text-gray-500').replace('text-gray-200', 'text-gray-500');
                         }}
-            let shortId = d.short_id || d.id.substring(0, 4).toUpperCase();
+                        let shortId = d.short_id || d.id.substring(0, 4).toUpperCase();
                         let titleText = d.name ? `${{shortId}} ${{d.name}}` : `${{shortId}} (${{d.os}})`;
 
                         return `<div onclick="openManageModal(${{index}})" class="bg-gray-800 hover:bg-gray-700 cursor-pointer rounded-2xl p-4 flex items-center justify-between border border-gray-700 mb-3 transition">
@@ -380,9 +468,6 @@ async def open_cabinet(token: str):
                 }}
             }}
 
-            const USER_ID = "{user_id}";
-
-        // Новая функция копирования реф. ссылки из инпута
             function copyRefFromInput() {{
                 const link = document.getElementById('ref-link-input').value;
                 try {{ navigator.clipboard.writeText(link); }} catch(e) {{}}
@@ -414,8 +499,9 @@ async def open_cabinet(token: str):
                 currentHistoryFilter = filter;
                 ['transactions', 'topups', 'actions'].forEach(f => {{
                     const btn = document.getElementById('filter-' + f);
-                    if(f === filter) {{ btn.className = "flex-1 py-2 rounded-lg bg-gray-700 text-white font-semibold transition"; }}
-                    else {{ btn.className = "flex-1 py-2 rounded-lg text-gray-400 transition"; }}
+                    btn.className = (f === filter)
+                        ? "flex-1 py-2 rounded-lg bg-gray-700 text-white font-semibold transition"
+                        : "flex-1 py-2 rounded-lg text-gray-400 transition";
                 }});
 
                 const container = document.getElementById('history-list-container');
@@ -440,12 +526,10 @@ async def open_cabinet(token: str):
                 container.innerHTML = html;
             }}
 
-
-        async function generateDevice(os) {{
+            async function generateDevice(os) {{
                 const name = document.getElementById('new-device-name').value.trim();
                 document.getElementById('add-step1-modal').classList.remove('modal-active');
-                
-                // Аккуратно меняем только заголовок, не трогая кнопки
+
                 document.getElementById('add-step2-modal').querySelector('h3').innerText = 'Генерируем ключи... ⏳';
                 document.getElementById('generated-key-display').innerText = 'Подключение к серверам...';
                 openModal('add-step2-modal');
@@ -476,9 +560,9 @@ async def open_cabinet(token: str):
                 window.location.reload();
             }}
 
-        async function updateDeviceKey() {{
+            async function updateDeviceKey() {{
                 if (!confirm("Вы уверены? Старый ключ перестанет работать!")) return;
-                
+
                 document.getElementById('manage-device-modal').classList.remove('modal-active');
                 document.getElementById('add-step2-modal').querySelector('h3').innerText = 'Обновляем ключи... ⏳';
                 document.getElementById('generated-key-display').innerText = 'Подключение к серверам...';
@@ -529,7 +613,7 @@ async def open_cabinet(token: str):
     </body>
     </html>
     """
-    return HTMLResponse(html_content)
+
 
 if __name__ == "__main__":
-    uvicorn.run("web:app", host="0.0.0.0", port=config.WEB_PORT, reload=True)
+    uvicorn.run("web:app", host=config.WEB_HOST, port=config.WEB_PORT, reload=True)

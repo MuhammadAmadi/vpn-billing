@@ -1,70 +1,105 @@
-# config.py — БЕЗОПАСНАЯ ВЕРСИЯ
-# Все секреты читаются из файла .env, НЕ хранятся в коде
-#
-# Как это работает:
-#   1. Библиотека python-dotenv читает файл .env
-#   2. Значения попадают в переменные окружения (os.environ)
-#   3. os.getenv("ИМЯ") берёт значение оттуда
-#   4. Если значение не найдено — используется значение по умолчанию (второй аргумент)
+"""Единая точка конфигурации. Все значения читаются из .env."""
 
 import os
+import sys
+from pathlib import Path
 from dotenv import load_dotenv
 
-# Загружаем файл .env (он должен лежать рядом с config.py)
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
-# ──────────────── Телеграм ────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# ──────────────── База данных ────────────────
-DB_USER = os.getenv("DB_USER", "siha_user")
-DB_PASS = os.getenv("DB_PASS")
-DB_NAME = os.getenv("DB_NAME", "sihavpn")
-DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
+def _env(name: str, default: str | None = None) -> str | None:
+    val = os.getenv(name, default)
+    return val.strip() if isinstance(val, str) else val
 
-# ──────────────── Сеть ────────────────
-MOSCOW_IP = os.getenv("MOSCOW_IP", "138.16.179.223")
-WEB_PORT   = int(os.getenv("WEB_PORT", "8000"))
 
-# Собираем полный URL кабинета автоматически
-CABINET_URL = f"http://{MOSCOW_IP}:{WEB_PORT}/cabinet"
-CABINET_BASE_URL = os.getenv("CABINET_BASE_URL", f"http://{MOSCOW_IP}:{WEB_PORT}")
-FALLBACK_CABINET_URL = os.getenv("FALLBACK_CABINET_URL", "https://backup.sihavpn.ru/cabinet")
-CHANNEL_URL         = os.getenv("CHANNEL_URL", "https://t.me/SihaVPN_news")
-SUPPORT_URL         = os.getenv("SUPPORT_URL", "https://t.me/SihaSupport")
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError as e:
+        raise EnvironmentError(f"{name} должен быть числом, получено: {raw!r}") from e
 
-# ──────────────── VPN-серверы ────────────────
-# Читаем настройки каждого сервера из .env
-# Если появится сервер3 — просто добавь SERVER3_* в .env и SERVER_COUNT=3
-SERVERS = []
-server_count = int(os.getenv("SERVER_COUNT", "2"))
-for i in range(1, server_count + 1):
-    host = os.getenv(f"SERVER{i}_HOST")
-    if host:
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError as e:
+        raise EnvironmentError(f"{name} должен быть числом, получено: {raw!r}") from e
+
+
+# ──────────── Логирование ────────────
+LOG_LEVEL = (_env("LOG_LEVEL", "INFO") or "INFO").upper()
+
+# ──────────── Админ-панель ────────────
+ADMIN_PASSWORD = _env("ADMIN_PASSWORD")
+ADMIN_SECRET = _env("ADMIN_SECRET")
+
+# ──────────── Телеграм ────────────
+BOT_TOKEN = _env("BOT_TOKEN")
+BOT_USERNAME = _env("BOT_USERNAME", "SihaVPN_bot")
+CHANNEL_ID = _env_int("CHANNEL_ID", 0)
+PROXY_URL = _env("PROXY_URL") or None
+
+# ──────────── База данных ────────────
+DB_USER = _env("DB_USER", "siha_user")
+DB_PASS = _env("DB_PASS")
+DB_NAME = _env("DB_NAME", "sihavpn")
+DB_HOST = _env("DB_HOST", "127.0.0.1")
+DB_PORT = _env_int("DB_PORT", 5432)
+DB_POOL_MIN = _env_int("DB_POOL_MIN", 2)
+DB_POOL_MAX = _env_int("DB_POOL_MAX", 10)
+
+# ──────────── Веб-сервер ────────────
+WEB_HOST = _env("WEB_HOST", "0.0.0.0")
+WEB_PORT = _env_int("WEB_PORT", 8000)
+CABINET_BASE_URL = (_env("CABINET_BASE_URL") or f"http://127.0.0.1:{WEB_PORT}").rstrip("/")
+FALLBACK_CABINET_URL = _env("FALLBACK_CABINET_URL", "https://backup.sihavpn.ru/cabinet")
+
+# ──────────── Ссылки в боте ────────────
+CHANNEL_URL = _env("CHANNEL_URL", "https://t.me/SihaVPN_news")
+SUPPORT_URL = _env("SUPPORT_URL", "https://t.me/SihaSupport")
+REFERRAL_URL_TEMPLATE = f"https://t.me/{BOT_USERNAME}?start={{user_id}}"
+
+# ──────────── Тарифы и бонусы ────────────
+PRICE_PER_DEVICE = _env_float("PRICE_PER_DEVICE", 3.33)
+BONUS_SUBSCRIBE = _env_float("BONUS_SUBSCRIBE", 25.0)
+BONUS_PHONE = _env_float("BONUS_PHONE", 95.0)
+BONUS_PHONE_SUB = _env_float("BONUS_PHONE_SUB", 5.0)
+
+# ──────────── VPN-серверы из .env (используются только при первой миграции) ────────────
+SERVERS: list[dict] = []
+_server_count = _env_int("SERVER_COUNT", 0)
+for _i in range(1, _server_count + 1):
+    _host = _env(f"SERVER{_i}_HOST")
+    if _host:
         SERVERS.append({
-            "name":      os.getenv(f"SERVER{i}_NAME",    f"Server{i}"),
-            "scheme":    os.getenv(f"SERVER{i}_SCHEME",   "https"),
-            "host":      host,
-            "port":      int(os.getenv(f"SERVER{i}_PORT", "2053")),
-            "base_path": os.getenv(f"SERVER{i}_BASE_PATH", ""),
-            "login":     os.getenv(f"SERVER{i}_LOGIN",    "admin"),
-            "password":  os.getenv(f"SERVER{i}_PASSWORD", "admin"),
+            "name":      _env(f"SERVER{_i}_NAME", f"Server{_i}"),
+            "scheme":    _env(f"SERVER{_i}_SCHEME", "https"),
+            "host":      _host,
+            "port":      _env_int(f"SERVER{_i}_PORT", 2053),
+            "base_path": _env(f"SERVER{_i}_BASE_PATH", ""),
+            "login":     _env(f"SERVER{_i}_LOGIN", "admin"),
+            "password":  _env(f"SERVER{_i}_PASSWORD", "admin"),
         })
 
-# ──────────────── Обход блокировок (Bypass) ────────────────
-_bypass_raw = os.getenv("BYPASS_IPS", "")
-BYPASS_IPS = [ip.strip() for ip in _bypass_raw.split(",")] if _bypass_raw else []
+# ──────────── Bypass-адреса из .env (только для первой миграции) ────────────
+_bypass_raw = _env("BYPASS_IPS", "") or ""
+BYPASS_IPS = [ip.strip() for ip in _bypass_raw.split(",") if ip.strip()]
 
-# ──────────────── Проверка при запуске ────────────────
-# Если каких-то критичных переменных нет — сразу говорим об этом,
-# чтобы не получить непонятную ошибку в середине работы
-_REQUIRED = {
-    "BOT_TOKEN": BOT_TOKEN,
-    "DB_PASS":   DB_PASS,
-}
+
+# ──────────── Проверка обязательных переменных ────────────
+_REQUIRED = {"BOT_TOKEN": BOT_TOKEN, "DB_PASS": DB_PASS}
 _missing = [name for name, val in _REQUIRED.items() if not val]
 if _missing:
-    raise EnvironmentError(
-        f"❌ Не найдены обязательные переменные в .env: {', '.join(_missing)}\n"
-        f"Скопируй .env.example в .env и заполни значения."
+    sys.stderr.write(
+        f"\n❌ Не найдены обязательные переменные в .env: {', '.join(_missing)}\n"
+        f"Скопируйте .env.example в .env и заполните значения.\n\n"
     )
+    raise EnvironmentError(f"Missing required env vars: {', '.join(_missing)}")

@@ -15,30 +15,29 @@
 # Адрес: https://ТВОЙ_ДОМЕН/admin
 # В .env:  ADMIN_PASSWORD=...   (ADMIN_SECRET=... — ключ подписи сессии, необязательно)
 
-import os
-import io
 import csv
-import hmac
 import hashlib
+import hmac
+import io
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-import config
-import server_store
-import users_store
-import bypass_store
-import config_files
-import error_log
-import xray_api
 import bot_content
 import broadcast
+import bypass_store
+import config
+import config_files
+import error_log
+import server_store
 import system_control
+import users_store
+import xray_api
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
-_SECRET = (os.getenv("ADMIN_SECRET") or config.BOT_TOKEN or "siha-default-secret").encode()
+ADMIN_PASSWORD = config.ADMIN_PASSWORD
+_SECRET = (config.ADMIN_SECRET or config.BOT_TOKEN or "siha-default-secret").encode()
 COOKIE_NAME = "siha_admin"
 
 

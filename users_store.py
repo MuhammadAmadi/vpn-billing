@@ -1,35 +1,37 @@
-# users_store.py — ПОЛЬЗОВАТЕЛИ ДЛЯ АДМИН-ПАНЕЛИ
-#
-# Считает по каждому пользователю:
-#   • topup_total  — суммарная сумма пополнений (сумма income-транзакций)
-#   • topup_count  — сколько раз пополнял (кол-во income-транзакций)
-#   • topup_streak — самая длинная СЕРИЯ пополнений подряд (по календарным дням)
-#   • device_count — количество устройств
-#   • balance      — текущий баланс
-#
-# Поддерживает пагинацию, сортировку (whitelist — без SQL-инъекций) и фильтры.
-# Изменение баланса пишется в transactions как 'action' (чтобы не портить
-# статистику реальных пополнений).
+"""Пользователи для админ-панели.
+
+По каждому пользователю считает:
+  • topup_total  — сумма пополнений (income-транзакции)
+  • topup_count  — сколько раз пополнял
+  • topup_streak — самая длинная серия пополнений подряд (по календарным дням)
+  • device_count — количество устройств
+  • balance      — текущий баланс
+
+Изменение баланса записывается в transactions как 'action' — чтобы не портить
+статистику реальных пополнений.
+"""
 
 from decimal import Decimal
-import config  # noqa: F401  (тянет .env, на случай отдельного использования)
+
+import config
+
 
 # Разрешённые сортировки. Ключ приходит из панели, значение — безопасный SQL.
 SORT_MAP = {
-    "topup_total":  "q.topup_total DESC NULLS LAST, q.user_id DESC",   # по сумме пополнений
-    "topup_count":  "q.topup_count DESC, q.user_id DESC",              # по кол-ву пополнений
-    "topup_streak": "q.topup_streak DESC, q.topup_count DESC",         # по серии подряд
-    "balance":      "q.balance DESC",                                  # по балансу
-    "devices":      "q.device_count DESC, q.user_id DESC",             # по устройствам
-    "newest":       "q.created_ts DESC",                               # новые
-    "oldest":       "q.created_ts ASC",                                # старые
+    "topup_total":  "q.topup_total DESC NULLS LAST, q.user_id DESC",
+    "topup_count":  "q.topup_count DESC, q.user_id DESC",
+    "topup_streak": "q.topup_streak DESC, q.topup_count DESC",
+    "balance":      "q.balance DESC",
+    "devices":      "q.device_count DESC, q.user_id DESC",
+    "newest":       "q.created_ts DESC",
+    "oldest":       "q.created_ts ASC",
 }
 
-# Фильтры по статусу. daily_cost = устройства × 3.33₽/день.
+# Фильтры по статусу. daily_cost = устройства × PRICE_PER_DEVICE.
 STATUS_MAP = {
     "all":          "TRUE",
-    "active":       "q.device_count > 0 AND q.balance >= q.device_count * 3.33",
-    "stopped":      "q.device_count > 0 AND q.balance <  q.device_count * 3.33",
+    "active":       "q.device_count > 0 AND q.balance >= q.device_count * $price",
+    "stopped":      "q.device_count > 0 AND q.balance <  q.device_count * $price",
     "with_devices": "q.device_count > 0",
     "no_devices":   "q.device_count = 0",
 }
@@ -75,23 +77,29 @@ LEFT JOIN dev    ON dev.user_id    = u.user_id
 """
 
 
-def _build_filtered(search, status):
-    """Возвращает (base_sql, params) с применёнными фильтрами (без сортировки/лимита)."""
-    status_sql = STATUS_MAP.get(status, "TRUE")
+def _build_filtered(search: str, status: str):
+    """Возвращает (sql, params) с применёнными фильтрами (без сортировки/лимита)."""
+    status_tpl = STATUS_MAP.get(status, "TRUE")
+    params: list = []
+    # Подставляем PRICE_PER_DEVICE как параметр, если статус его использует
+    if "$price" in status_tpl:
+        params.append(config.PRICE_PER_DEVICE)
+        status_sql = status_tpl.replace("$price", f"${len(params)}")
+    else:
+        status_sql = status_tpl
     where = [status_sql]
-    params = []
     if search:
         params.append(f"%{search.strip()}%")
         p = f"${len(params)}"
         where.append(
             f"(CAST(q.user_id AS TEXT) LIKE {p} OR q.username ILIKE {p} OR COALESCE(q.phone,'') ILIKE {p})"
         )
-    where_sql = " AND ".join(where)
-    base = f"SELECT q.* FROM ({_INNER}) q WHERE {where_sql}"
+    base = f"SELECT q.* FROM ({_INNER}) q WHERE {' AND '.join(where)}"
     return base, params
 
 
-async def get_users(conn, *, search="", status="all", sort="topup_total", page=1, page_size=25):
+async def get_users(conn, *, search: str = "", status: str = "all",
+                    sort: str = "topup_total", page: int = 1, page_size: int = 25) -> dict:
     sort_sql = SORT_MAP.get(sort, SORT_MAP["topup_total"])
 
     page = max(1, int(page))
@@ -99,7 +107,6 @@ async def get_users(conn, *, search="", status="all", sort="topup_total", page=1
     offset = (page - 1) * page_size
 
     base, params = _build_filtered(search, status)
-
     total = await conn.fetchval(f"SELECT COUNT(*) FROM ({base}) cnt", *params)
 
     limit_p = f"${len(params) + 1}"
@@ -118,40 +125,44 @@ async def get_users(conn, *, search="", status="all", sort="topup_total", page=1
     }
 
 
-async def set_balance(conn, user_id, new_balance, note="Изменение баланса (админ)"):
-    """Устанавливает точный баланс и записывает корректировку в историю."""
-    row = await conn.fetchrow("SELECT balance FROM users WHERE user_id = $1", int(user_id))
-    if not row:
-        return None
-    old = float(row["balance"])
-    nb = round(float(new_balance), 2)
-    await conn.execute(
-        "UPDATE users SET balance = $1 WHERE user_id = $2",
-        Decimal(str(nb)), int(user_id),
-    )
-    delta = round(nb - old, 2)
-    sign = "+" if delta >= 0 else "-"
-    await conn.execute(
-        '''INSERT INTO transactions (user_id, type, title, description, amount)
-           VALUES ($1, 'action', $2, $3, $4)''',
-        int(user_id), note, f"Было {old:.2f}₽ → стало {nb:.2f}₽", f"{sign}{abs(delta):.2f}₽",
-    )
+async def set_balance(conn, user_id, new_balance, note: str = "Изменение баланса (админ)"):
+    """Устанавливает точный баланс и записывает корректировку в одной транзакции."""
+    async with conn.transaction():
+        row = await conn.fetchrow(
+            "SELECT balance FROM users WHERE user_id = $1 FOR UPDATE", int(user_id)
+        )
+        if not row:
+            return None
+        old = float(row["balance"])
+        nb = round(float(new_balance), 2)
+        await conn.execute(
+            "UPDATE users SET balance = $1 WHERE user_id = $2",
+            Decimal(str(nb)), int(user_id),
+        )
+        delta = round(nb - old, 2)
+        sign = "+" if delta >= 0 else "-"
+        await conn.execute(
+            """INSERT INTO transactions (user_id, type, title, description, amount)
+               VALUES ($1, 'action', $2, $3, $4)""",
+            int(user_id), note, f"Было {old:.2f}₽ → стало {nb:.2f}₽", f"{sign}{abs(delta):.2f}₽",
+        )
     return nb
 
 
-async def get_user_card(conn, user_id):
+async def get_user_card(conn, user_id) -> dict | None:
     """Краткая карточка пользователя для модалки изменения баланса."""
     r = await conn.fetchrow(
-        '''SELECT u.user_id, u.username, u.phone, u.balance::float8 AS balance,
+        """SELECT u.user_id, u.username, u.phone, u.balance::float8 AS balance,
                   (SELECT COUNT(*) FROM devices WHERE user_id = u.user_id) AS device_count
-           FROM users u WHERE u.user_id = $1''',
+           FROM users u WHERE u.user_id = $1""",
         int(user_id),
     )
     return dict(r) if r else None
 
 
-async def export_users(conn, *, search="", status="all", sort="topup_total", limit=100000):
-    """Все пользователи под текущими фильтрами (без пагинации) — для CSV."""
+async def export_users(conn, *, search: str = "", status: str = "all",
+                       sort: str = "topup_total", limit: int = 100000) -> list[dict]:
+    """Все пользователи под фильтрами (без пагинации) — для CSV."""
     sort_sql = SORT_MAP.get(sort, SORT_MAP["topup_total"])
     base, params = _build_filtered(search, status)
     rows = await conn.fetch(
@@ -161,39 +172,39 @@ async def export_users(conn, *, search="", status="all", sort="topup_total", lim
     return [dict(r) for r in rows]
 
 
-async def get_user_detail(conn, user_id):
+async def get_user_detail(conn, user_id) -> dict | None:
     """Полная карточка: данные + устройства + история транзакций."""
     user = await conn.fetchrow(
-        '''SELECT user_id, username, phone, balance::float8 AS balance, magic_token,
+        """SELECT user_id, username, phone, balance::float8 AS balance, magic_token,
                   TO_CHAR(created_at, 'DD.MM.YYYY') AS created
-           FROM users WHERE user_id = $1''',
+           FROM users WHERE user_id = $1""",
         int(user_id),
     )
     if not user:
         return None
 
     devices = await conn.fetch(
-        '''SELECT id, short_id, name, os, TO_CHAR(created_at, 'DD.MM.YY') AS created
-           FROM devices WHERE user_id = $1 ORDER BY created_at DESC''',
+        """SELECT id, short_id, name, os, TO_CHAR(created_at, 'DD.MM.YY') AS created
+           FROM devices WHERE user_id = $1 ORDER BY created_at DESC""",
         int(user_id),
     )
 
     history = await conn.fetch(
-        '''SELECT type, title, description AS descr, amount,
+        """SELECT type, title, description AS descr, amount,
                   TO_CHAR(created_at, 'DD.MM.YY HH24:MI') AS ts
            FROM transactions WHERE user_id = $1
-           ORDER BY created_at DESC LIMIT 100''',
+           ORDER BY created_at DESC LIMIT 100""",
         int(user_id),
     )
 
-    base_url = getattr(config, "CABINET_BASE_URL", "")
+    base_url = config.CABINET_BASE_URL
     dev_list = []
     for d in devices:
         dd = dict(d)
-        dd["sub_url"] = f"{base_url}/sub/{dd['id']}" if base_url else f"/sub/{dd['id']}"
+        dd["sub_url"] = f"{base_url}/sub/{dd['id']}"
         dev_list.append(dd)
 
     u = dict(user)
-    u["cabinet_url"] = f"{base_url}/cabinet/{u['magic_token']}" if (base_url and u.get("magic_token")) else None
-    u.pop("magic_token", None)  # токен наружу не отдаём
+    u["cabinet_url"] = f"{base_url}/cabinet/{u['magic_token']}" if u.get("magic_token") else None
+    u.pop("magic_token", None)
     return {"user": u, "devices": dev_list, "history": [dict(h) for h in history]}

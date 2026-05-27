@@ -1,18 +1,20 @@
-# bot_content.py — ТЕКСТЫ И КНОПКИ БОТА (редактируются из админ-панели)
-#
-# Тексты сообщений и раскладка кнопок хранятся в БД (таблицы bot_messages,
-# bot_buttons) и редактируются в панели. Бот читает их при каждом сообщении.
-# Если БД недоступна или запись отсутствует — берётся ДЕФОЛТ (бот не ломается).
-#
-# Кнопки маршрутизируются по полю `action` (стабильный идентификатор), а не по
-# тексту. Поэтому кнопку можно переименовать/выключить/подвинуть, и обработчик
-# всё равно сработает. kind='action' — встроенное поведение; kind='message' —
-# кнопка просто показывает текст из bot_messages[msg_key].
+"""Тексты и кнопки бота, редактируемые из админ-панели.
 
-import asyncpg
-import config
+Хранятся в БД (bot_messages, bot_buttons). Если БД временно недоступна или
+ключ отсутствует — берётся значение из DEFAULT_*, бот не падает.
 
-# ─── Встроенные действия (для kind='action') ───
+Кнопки маршрутизируются по полю `action` (стабильный идентификатор), поэтому
+текст можно менять — обработчик всё равно сработает.
+"""
+
+import logging
+
+import db
+
+log = logging.getLogger(__name__)
+
+
+# ─── Встроенные действия (kind='action') ───
 ACTIONS = {
     "cabinet":         "Личный кабинет",
     "bonus_subscribe": "Бонус за подписку",
@@ -29,7 +31,8 @@ ACTIONS = {
 
 MENUS = ["main", "help", "not_found", "about"]
 
-# ─── Дефолтные тексты (равны текущим в bot.py) ───
+
+# ─── Дефолтные тексты ───
 DEFAULT_MESSAGES = {
     "welcome": {
         "title": "Приветствие (/start)",
@@ -64,11 +67,11 @@ DEFAULT_MESSAGES = {
             "<i>*1 день = 3.33₽</i>"
         ),
     },
-    "help_intro":     {"title": "Помощь — заголовок", "placeholders": "", "text": "Раздел помощи. Выберите вашу проблему:"},
-    "main_menu":      {"title": "Возврат в меню", "placeholders": "", "text": "Вы вернулись в главное меню 👇"},
-    "cabinet_caption":{"title": "Подпись к ссылке кабинета", "placeholders": "", "text": "⬇️ <b>Ваша индивидуальная ссылка:</b> ⬇️"},
-    "cabinet_return": {"title": "После выдачи кабинета", "placeholders": "", "text": "Возвращаю вас в главное меню."},
-    "cabinet_broken": {"title": "Кабинет не работает", "placeholders": "", "text": "Если основной сайт заблокирован, используйте резервную ссылку."},
+    "help_intro":      {"title": "Помощь — заголовок", "placeholders": "", "text": "Раздел помощи. Выберите вашу проблему:"},
+    "main_menu":       {"title": "Возврат в меню", "placeholders": "", "text": "Вы вернулись в главное меню 👇"},
+    "cabinet_caption": {"title": "Подпись к ссылке кабинета", "placeholders": "", "text": "⬇️ <b>Ваша индивидуальная ссылка:</b> ⬇️"},
+    "cabinet_return":  {"title": "После выдачи кабинета", "placeholders": "", "text": "Возвращаю вас в главное меню."},
+    "cabinet_broken":  {"title": "Кабинет не работает", "placeholders": "", "text": "Если основной сайт заблокирован, используйте резервную ссылку."},
     "vpn_broken": {
         "title": "VPN не работает",
         "placeholders": "",
@@ -80,16 +83,13 @@ DEFAULT_MESSAGES = {
             "Если не помогло — обратитесь в поддержку."
         ),
     },
-    "about": {"title": "Об этом боте", "placeholders": "",
-              "text": "Это информационный бот сервиса <b>SihaVPN</b>.\nВсе услуги и ключи — в Личном кабинете."},
-    "not_found": {"title": "Не нашёл ответ", "placeholders": "",
-                  "text": "Ничего страшного! Наша поддержка готова помочь."},
-    "support": {"title": "Чат поддержки", "placeholders": "{support_url}",
-                "text": "Напишите нашему специалисту: {support_url}"},
+    "about":     {"title": "Об этом боте",   "placeholders": "",              "text": "Это информационный бот сервиса <b>SihaVPN</b>.\nВсе услуги и ключи — в Личном кабинете."},
+    "not_found": {"title": "Не нашёл ответ", "placeholders": "",              "text": "Ничего страшного! Наша поддержка готова помочь."},
+    "support":   {"title": "Чат поддержки",  "placeholders": "{support_url}", "text": "Напишите нашему специалисту: {support_url}"},
 }
 
-# ─── Дефолтная раскладка кнопок (равна текущим клавиатурам bot.py) ───
-# (menu, action, text, row, position)
+
+# ─── Дефолтная раскладка кнопок (menu, action, text, row, position) ───
 DEFAULT_BUTTONS = [
     ("main", "cabinet",         "👤 Личный кабинет", 0, 0),
     ("main", "bonus_subscribe", "🎁 Бонус 7 дней",   1, 0),
@@ -112,61 +112,50 @@ DEFAULT_BUTTONS = [
 ]
 
 
-async def _connect():
-    return await asyncpg.connect(
-        user=config.DB_USER, password=config.DB_PASS,
-        database=config.DB_NAME, host=config.DB_HOST,
-    )
-
-
-# ──────────── СООБЩЕНИЯ ────────────
-def _default_message(key):
+# ──────────── Сообщения ────────────
+def _default_message(key: str) -> str:
     d = DEFAULT_MESSAGES.get(key)
     return d["text"] if d else ""
 
 
-async def get_message(key, conn=None):
+async def get_message(key: str, conn=None) -> str:
     """Текст сообщения по ключу (с фолбэком на дефолт). Никогда не падает."""
-    own = False
     try:
-        if conn is None:
-            conn = await _connect(); own = True
-        v = await conn.fetchval("SELECT text FROM bot_messages WHERE key = $1", key)
+        if conn is not None:
+            v = await conn.fetchval("SELECT text FROM bot_messages WHERE key = $1", key)
+        else:
+            pool = await db.get_pool()
+            async with pool.acquire() as c:
+                v = await c.fetchval("SELECT text FROM bot_messages WHERE key = $1", key)
         return v if v is not None else _default_message(key)
     except Exception as e:
-        print(f"⚠️ [bot_content] get_message('{key}'): {e}")
+        log.warning("get_message('%s') failed: %s", key, e)
         return _default_message(key)
-    finally:
-        if own and conn is not None:
-            try: await conn.close()
-            except Exception: pass
 
 
-async def list_messages(conn):
+async def list_messages(conn) -> list[dict]:
     rows = await conn.fetch("SELECT key, title, text, placeholders FROM bot_messages ORDER BY key")
     by_key = {r["key"]: dict(r) for r in rows}
-    # дополняем недостающие дефолтами (если миграция не заполнила)
     out = []
     for key, d in DEFAULT_MESSAGES.items():
-        if key in by_key:
-            out.append(by_key[key])
-        else:
-            out.append({"key": key, "title": d["title"], "text": d["text"], "placeholders": d["placeholders"]})
+        out.append(by_key.get(key) or {
+            "key": key, "title": d["title"], "text": d["text"], "placeholders": d["placeholders"]
+        })
     return out
 
 
-async def update_message(conn, key, text):
+async def update_message(conn, key: str, text: str) -> None:
     title = DEFAULT_MESSAGES.get(key, {}).get("title", key)
     ph = DEFAULT_MESSAGES.get(key, {}).get("placeholders", "")
     await conn.execute(
-        '''INSERT INTO bot_messages (key, title, text, placeholders) VALUES ($1,$2,$3,$4)
-           ON CONFLICT (key) DO UPDATE SET text = EXCLUDED.text''',
+        """INSERT INTO bot_messages (key, title, text, placeholders) VALUES ($1,$2,$3,$4)
+           ON CONFLICT (key) DO UPDATE SET text = EXCLUDED.text""",
         key, title, text, ph,
     )
 
 
-# ──────────── КНОПКИ ────────────
-def _default_menu_rows(menu):
+# ──────────── Кнопки ────────────
+def _default_menu_rows(menu: str) -> list[list[dict]]:
     btns = [b for b in DEFAULT_BUTTONS if b[0] == menu]
     return _group_rows([
         {"action": a, "text": t, "row": r, "position": p, "kind": "action", "msg_key": None}
@@ -174,74 +163,73 @@ def _default_menu_rows(menu):
     ])
 
 
-def _group_rows(buttons):
-    """Сортирует и группирует плоский список кнопок в строки [[btn,btn],[btn],...]."""
+def _group_rows(buttons: list[dict]) -> list[list[dict]]:
+    """Группирует плоский список кнопок в строки [[btn,btn],[btn],...]."""
     buttons = sorted(buttons, key=lambda b: (b["row"], b["position"]))
     rows, cur, cur_row = [], [], None
     for b in buttons:
         if cur_row is None:
             cur_row = b["row"]
         if b["row"] != cur_row:
-            rows.append(cur); cur = []; cur_row = b["row"]
+            rows.append(cur)
+            cur, cur_row = [], b["row"]
         cur.append(b)
     if cur:
         rows.append(cur)
     return rows
 
 
-async def get_menu_rows(menu, conn=None):
+async def get_menu_rows(menu: str, conn=None) -> list[list[dict]]:
     """Строки кнопок для меню (только включённые). Фолбэк на дефолт."""
-    own = False
     try:
-        if conn is None:
-            conn = await _connect(); own = True
-        rows = await conn.fetch(
-            "SELECT action, text, kind, msg_key, row, position FROM bot_buttons "
-            "WHERE menu = $1 AND enabled = TRUE ORDER BY row, position",
-            menu,
-        )
+        if conn is not None:
+            rows = await conn.fetch(
+                "SELECT action, text, kind, msg_key, row, position FROM bot_buttons "
+                "WHERE menu = $1 AND enabled = TRUE ORDER BY row, position",
+                menu,
+            )
+        else:
+            pool = await db.get_pool()
+            async with pool.acquire() as c:
+                rows = await c.fetch(
+                    "SELECT action, text, kind, msg_key, row, position FROM bot_buttons "
+                    "WHERE menu = $1 AND enabled = TRUE ORDER BY row, position",
+                    menu,
+                )
         if rows:
             return _group_rows([dict(r) for r in rows])
         return _default_menu_rows(menu)
     except Exception as e:
-        print(f"⚠️ [bot_content] get_menu_rows('{menu}'): {e}")
+        log.warning("get_menu_rows('%s') failed: %s", menu, e)
         return _default_menu_rows(menu)
-    finally:
-        if own and conn is not None:
-            try: await conn.close()
-            except Exception: pass
 
 
-async def resolve_text(text, conn=None):
+async def resolve_text(text: str, conn=None) -> dict | None:
     """По тексту кнопки вернуть {action, kind, msg_key} или None. Фолбэк на дефолт."""
-    own = False
     try:
-        if conn is None:
-            conn = await _connect(); own = True
-        r = await conn.fetchrow(
-            "SELECT action, kind, msg_key FROM bot_buttons WHERE text = $1 AND enabled = TRUE LIMIT 1",
-            text,
-        )
+        if conn is not None:
+            r = await conn.fetchrow(
+                "SELECT action, kind, msg_key FROM bot_buttons WHERE text = $1 AND enabled = TRUE LIMIT 1",
+                text,
+            )
+        else:
+            pool = await db.get_pool()
+            async with pool.acquire() as c:
+                r = await c.fetchrow(
+                    "SELECT action, kind, msg_key FROM bot_buttons WHERE text = $1 AND enabled = TRUE LIMIT 1",
+                    text,
+                )
         if r:
             return dict(r)
-        # фолбэк: ищем в дефолтах
-        for (_m, a, t, _r, _p) in DEFAULT_BUTTONS:
-            if t == text:
-                return {"action": a, "kind": "action", "msg_key": None}
-        return None
     except Exception as e:
-        print(f"⚠️ [bot_content] resolve_text: {e}")
-        for (_m, a, t, _r, _p) in DEFAULT_BUTTONS:
-            if t == text:
-                return {"action": a, "kind": "action", "msg_key": None}
-        return None
-    finally:
-        if own and conn is not None:
-            try: await conn.close()
-            except Exception: pass
+        log.warning("resolve_text failed: %s", e)
+    for (_m, a, t, _r, _p) in DEFAULT_BUTTONS:
+        if t == text:
+            return {"action": a, "kind": "action", "msg_key": None}
+    return None
 
 
-async def list_buttons(conn):
+async def list_buttons(conn) -> list[dict]:
     rows = await conn.fetch(
         "SELECT id, menu, action, text, kind, msg_key, row, position, enabled "
         "FROM bot_buttons ORDER BY menu, row, position, id"
@@ -249,29 +237,29 @@ async def list_buttons(conn):
     return [dict(r) for r in rows]
 
 
-async def save_button(conn, data):
+async def save_button(conn, data: dict) -> None:
     if data.get("id"):
         await conn.execute(
-            '''UPDATE bot_buttons SET menu=$1, action=$2, text=$3, kind=$4, msg_key=$5,
-                                      row=$6, position=$7, enabled=$8 WHERE id=$9''',
+            """UPDATE bot_buttons SET menu=$1, action=$2, text=$3, kind=$4, msg_key=$5,
+                                      row=$6, position=$7, enabled=$8 WHERE id=$9""",
             data["menu"], data["action"], data["text"], data.get("kind", "action"),
             data.get("msg_key") or None, int(data.get("row", 0)), int(data.get("position", 0)),
             bool(data.get("enabled", True)), int(data["id"]),
         )
     else:
         await conn.execute(
-            '''INSERT INTO bot_buttons (menu, action, text, kind, msg_key, row, position, enabled)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8)''',
+            """INSERT INTO bot_buttons (menu, action, text, kind, msg_key, row, position, enabled)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8)""",
             data["menu"], data["action"], data["text"], data.get("kind", "action"),
             data.get("msg_key") or None, int(data.get("row", 0)), int(data.get("position", 0)),
             bool(data.get("enabled", True)),
         )
 
 
-async def delete_button(conn, bid):
+async def delete_button(conn, bid) -> None:
     await conn.execute("DELETE FROM bot_buttons WHERE id = $1", int(bid))
 
 
-async def toggle_button(conn, bid):
+async def toggle_button(conn, bid) -> bool:
     await conn.execute("UPDATE bot_buttons SET enabled = NOT enabled WHERE id = $1", int(bid))
     return await conn.fetchval("SELECT enabled FROM bot_buttons WHERE id = $1", int(bid))
