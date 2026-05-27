@@ -169,6 +169,7 @@ async def api_server_test(request: Request):
                 "base_path": data.get("base_path", ""), "login": data.get("login", "admin"),
                 "password": data.get("password", "admin"),
                 "api_token": data.get("api_token", ""),
+                "client_host": data.get("client_host", ""),
             }
         if not server:
             return {"status": "error", "msg": "Сервер не найден"}
@@ -729,7 +730,8 @@ DASHBOARD_HTML = """<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">
       <div class="col-span-2"><label class="text-xs text-gray-400">Имя сервера</label><input id="f-name" class="inp" placeholder="Amsterdam-VDSina"></div>
       <div><label class="text-xs text-gray-400">Схема</label><select id="f-scheme" class="inp"><option>https</option><option>http</option></select></div>
       <div><label class="text-xs text-gray-400">Порт</label><input id="f-port" class="inp" value="2053"></div>
-      <div class="col-span-2"><label class="text-xs text-gray-400">Host</label><input id="f-host" class="inp" placeholder="appaz.xyz"></div>
+      <div class="col-span-2"><label class="text-xs text-gray-400">Host (IP-адрес для API)</label><input id="f-host" class="inp" placeholder="144.124.x.x"></div>
+      <div class="col-span-2"><label class="text-xs text-gray-400">Домен для клиентов (оставь пустым, чтобы использовать IP)</label><input id="f-client_host" class="inp" placeholder="media.appaz.xyz"></div>
       <div class="col-span-2"><label class="text-xs text-gray-400">Base path (без слэшей)</label><input id="f-base_path" class="inp" placeholder="ac0b8e07..."></div>
       
       <div class="col-span-2">
@@ -838,6 +840,10 @@ async function loadServers(){
     return `<div class="bg-gray-800 rounded-2xl p-4 border border-gray-700 flex items-center justify-between gap-3" data-server-id="${s.id}">
       <div class="min-w-0"><div class="font-bold flex items-center gap-2"><span class="w-2.5 h-2.5 rounded-full ${dot}" data-dot></span> ${esc(s.name)} <span class="text-xs text-gray-500" data-status>${st}</span></div>
       <div class="text-xs text-gray-400 mt-1 truncate">${esc(s.scheme)}://${esc(s.host)}:${s.port}/${esc(s.base_path)}</div>
+      <div class="text-[10px] mt-1 bg-gray-900 inline-block px-2 py-0.5 rounded border border-gray-700">
+         API: <b class="text-gray-400">${esc(s.host)}</b> <span class="mx-1 text-gray-600">|</span> 
+         Клиентам: <b class="${s.client_host ? 'text-blue-400' : 'text-gray-400'}">${esc(s.client_host || s.host)}</b>
+      </div>
       <div class="text-xs mt-1 hidden" data-health></div></div>
       <div class="flex items-center gap-2 flex-shrink-0">
         <button onclick="testServerById(${s.id})" title="Проверить" class="bg-gray-700 hover:bg-gray-600 w-9 h-9 rounded-lg"><i class="fa-solid fa-plug-circle-check"></i></button>
@@ -879,6 +885,7 @@ function openServerModal(id){
   document.getElementById('f-scheme').value=s?s.scheme:'https';
   document.getElementById('f-port').value=s?s.port:'2053';
   document.getElementById('f-host').value=s?s.host:'';
+  document.getElementById('f-client_host').value=s?(s.client_host||''):'';
   document.getElementById('f-base_path').value=s?s.base_path:'';
   document.getElementById('f-login').value=s?s.login:'admin';
   document.getElementById('f-password').value=s?s.password:'';
@@ -902,6 +909,7 @@ function serverForm() {
     scheme: document.getElementById('f-scheme').value,
     port: parseInt(document.getElementById('f-port').value) || 2053,
     host: document.getElementById('f-host').value.trim(),
+    client_host: document.getElementById('f-client_host').value.trim(),
     base_path: document.getElementById('f-base_path').value.trim().replace(/^\/+|\/+$/g, ''),
     login: authType === 'login' ? document.getElementById('f-login').value.trim() : "",
     password: authType === 'login' ? document.getElementById('f-password').value : "",

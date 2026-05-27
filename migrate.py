@@ -76,6 +76,7 @@ SCHEMA = [
         login       VARCHAR(255) NOT NULL DEFAULT 'admin',
         password    VARCHAR(255) NOT NULL DEFAULT 'admin',
         api_token   VARCHAR(255) NOT NULL DEFAULT '',
+        client_host VARCHAR(255) NOT NULL DEFAULT '',
         is_active   BOOLEAN      NOT NULL DEFAULT TRUE,
         sort_order  INTEGER      NOT NULL DEFAULT 0,
         created_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
@@ -125,6 +126,7 @@ ALTERS = [
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS bonus_given BOOLEAN DEFAULT FALSE;",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_bonus_given BOOLEAN DEFAULT FALSE;",
     "ALTER TABLE servers ADD COLUMN IF NOT EXISTS api_token VARCHAR(255) NOT NULL DEFAULT '';",
+    "ALTER TABLE servers ADD COLUMN IF NOT EXISTS client_host VARCHAR(255) NOT NULL DEFAULT '';",
 ]
 
 INDEXES = [

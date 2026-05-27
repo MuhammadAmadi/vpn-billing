@@ -19,6 +19,7 @@ def _row_to_server(r) -> dict:
         "login":     r["login"],
         "password":  r["password"],
         "api_token": r.get("api_token", ""),
+        "client_host": r.get("client_host", ""),
         "is_active": r["is_active"],
     }
 
@@ -52,21 +53,21 @@ async def get_server(conn, server_id) -> dict | None:
 async def add_server(conn, data: dict) -> int:
     next_order = await conn.fetchval("SELECT COALESCE(MAX(sort_order)+1, 0) FROM servers")
     return await conn.fetchval(
-        """INSERT INTO servers (name, scheme, host, port, base_path, login, password, api_token, is_active, sort_order)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id""",
+        """INSERT INTO servers (name, scheme, host, port, base_path, login, password, api_token, client_host, is_active, sort_order)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id""",
         data["name"], data.get("scheme", "https"), data["host"], int(data.get("port", 2053)),
         data.get("base_path", ""), data.get("login", "admin"), data.get("password", "admin"),
-        data.get("api_token", ""), bool(data.get("is_active", True)), next_order,
+        data.get("api_token", ""), data.get("client_host", ""), bool(data.get("is_active", True)), next_order,
     )
 
 
 async def update_server(conn, server_id, data: dict) -> None:
     await conn.execute(
-        """UPDATE servers SET name=$1, scheme=$2, host=$3, port=$4, base_path=$5, login=$6, password=$7,
-               api_token=$8, is_active=$9 WHERE id = $10""",
+        """UPDATE servers SET name=$1, scheme=$2, host=$3, port=$4, base_path=$5,
+                              login=$6, password=$7, api_token=$8, client_host=$9, is_active=$10 WHERE id=$11""",
         data["name"], data.get("scheme", "https"), data["host"], int(data.get("port", 2053)),
         data.get("base_path", ""), data.get("login", "admin"), data.get("password", "admin"),
-        data.get("api_token", ""), bool(data.get("is_active", True)), int(server_id),
+        data.get("api_token", ""), data.get("client_host", ""), bool(data.get("is_active", True)), int(server_id),
     )
 
 

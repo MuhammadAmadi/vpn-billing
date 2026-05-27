@@ -211,8 +211,11 @@ async def add_client_to_all_servers(client_uuid: str, email: str,
                             level="warning", details=f"inbound={inbound_id}",
                         )
                         continue
+
+                    # Определяем, какой домен отдать клиенту
+                    target_host = server.get("client_host") or server["host"]
                     host, custom_name, bypass_counter = _resolve_bypass_host(
-                        remark, server["host"], bypass_ips, bypass_counter,
+                        remark, target_host, bypass_ips, bypass_counter,
                     )
                     link = build_vless_link(client_uuid, unique_email, host, inbound, custom_name)
                     gathered_links.append(link)
@@ -356,8 +359,11 @@ async def get_client_links_from_all_servers(client_uuid: str, email: str,
                             continue
                         real_uuid = client_uuid
 
+                    # Определяем, какой домен отдать клиенту
+                    target_host = server.get("client_host") or server["host"]
+
                     host, custom_name, bypass_counter = _resolve_bypass_host(
-                        remark, server["host"], bypass_ips, bypass_counter,
+                        remark, target_host, bypass_ips, bypass_counter,
                     )
                     link = build_vless_link(client_uuid, unique_email, host, inbound, custom_name)
                     gathered_links.append(link)
