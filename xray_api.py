@@ -34,10 +34,24 @@ def _is_premium(remark: str) -> bool:
     return any(m in upper for m in PREMIUM_MARKS)
 
 
+def _is_bypass(remark: str) -> bool:
+    return BYPASS_MARK in remark.upper()
+
+
 def _skip_for_tariff(remark: str, tariff: str) -> bool:
     if _is_private(remark):
         return True
     return tariff == "Standard" and _is_premium(remark)
+
+
+def _should_skip_inbound(remark: str, tariff: str, bypass_ips: list[str]) -> bool:
+    """True — этот inbound нужно полностью пропустить (не звать addClient,
+    не строить ссылку). Учитывает тариф и наличие активных bypass-IP."""
+    if _skip_for_tariff(remark, tariff):
+        return True
+    if _is_bypass(remark) and not bypass_ips:
+        return True
+    return False
 
 
 def _parse_json_field(value, default=None):
@@ -187,10 +201,14 @@ def _find_client_uuid(inbound: dict, unique_email: str) -> str | None:
 
 def _resolve_bypass_host(remark: str, server_host: str,
                          bypass_ips: list[str], counter: int) -> tuple[str, str | None, int]:
-    """Если inbound помечен как BYPASS — возвращает (адрес из списка, имя 'ОБХОД N', новый счётчик)."""
-    if BYPASS_MARK not in remark.upper():
+    """Если inbound помечен как BYPASS — возвращает (адрес из списка, имя 'ОБХОД N', новый счётчик).
+    Пустой bypass_ips сюда не должен попасть: BYPASS-inbound отсеивается раньше
+    через _should_skip_inbound, но на всякий случай делаем фолбэк на server_host."""
+    if not _is_bypass(remark):
         return server_host, None, counter
-    host = bypass_ips[counter % len(bypass_ips)] if bypass_ips else server_host
+    if not bypass_ips:
+        return server_host, None, counter
+    host = bypass_ips[counter % len(bypass_ips)]
     return host, f"ОБХОД {counter + 1}", counter + 1
 
 
@@ -206,13 +224,23 @@ async def _fetch_inbounds(client: httpx.AsyncClient, base_url: str,
 
 
 async def _add_client(client: httpx.AsyncClient, base_url: str, auth_kwargs: dict,
-                      inbound_id: int, uuid: str, email: str) -> bool:
+                      inbound_id: int, uuid: str, email: str) -> tuple[bool, str]:
+    """Возвращает (ok, error_message). error_message пустой при ok=True,
+    иначе содержит причину от панели (msg) или фрагмент ответа."""
     payload = {"id": inbound_id, "settings": json.dumps(_client_payload(uuid, email))}
-    resp = await client.post(
-        f"{base_url}/panel/api/inbounds/addClient",
-        json=payload, timeout=HTTP_TIMEOUT, **auth_kwargs
-    )
-    return resp.status_code == 200 and _safe_json(resp).get("success", False)
+    try:
+        resp = await client.post(
+            f"{base_url}/panel/api/inbounds/addClient",
+            json=payload, timeout=HTTP_TIMEOUT, **auth_kwargs
+        )
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+    data = _safe_json(resp)
+    if resp.status_code == 200 and data.get("success", False):
+        return True, ""
+    panel_msg = data.get("msg") or data.get("message") or (resp.text or "")[:300]
+    return False, f"HTTP {resp.status_code}: {panel_msg}"
 
 
 async def add_client_to_all_servers(client_uuid: str, email: str,
@@ -231,26 +259,24 @@ async def add_client_to_all_servers(client_uuid: str, email: str,
                 log.warning("Пропускаю %s — нет авторизации", server["name"])
                 continue
             try:
-                # Передаем auth_kwargs
                 inbounds = await _fetch_inbounds(client, base_url, auth_kwargs, server["name"])
                 for inbound in inbounds:
                     remark = inbound.get("remark", "")
-                    if _skip_for_tariff(remark, tariff):
+                    if _should_skip_inbound(remark, tariff, bypass_ips):
                         continue
                     inbound_id = inbound.get("id")
                     unique_email = f"{email}_i{inbound_id}"
 
-                    # Передаем auth_kwargs
-                    if not await _add_client(client, base_url, auth_kwargs, inbound_id,
-                                             client_uuid, unique_email):
+                    ok, err = await _add_client(client, base_url, auth_kwargs, inbound_id,
+                                                client_uuid, unique_email)
+                    if not ok:
                         await log_error(
                             "addClient вернул ошибку",
                             source="xray_api", server_name=server.get("name"),
-                            level="warning", details=f"inbound={inbound_id}",
+                            level="warning", details=f"inbound={inbound_id}: {err}",
                         )
                         continue
 
-                    # Определяем, какой домен отдать клиенту
                     target_host = server.get("client_host") or server["host"]
                     host, custom_name, bypass_counter = _resolve_bypass_host(
                         remark, target_host, bypass_ips, bypass_counter,
@@ -361,7 +387,7 @@ async def get_client_links_from_all_servers(client_uuid: str, email: str,
                 inbounds = await _fetch_inbounds(client, base_url, auth_kwargs, server["name"])
                 for inbound in inbounds:
                     remark = inbound.get("remark", "")
-                    if _skip_for_tariff(remark, tariff):
+                    if _should_skip_inbound(remark, tariff, bypass_ips):
                         continue
                     inbound_id = inbound["id"]
                     unique_email = f"{email}_i{inbound_id}"
@@ -369,19 +395,18 @@ async def get_client_links_from_all_servers(client_uuid: str, email: str,
 
                     if not real_uuid:
                         log.info("%s: %s не найден на сервере, добавляю", server["name"], unique_email)
-                        if not await _add_client(client, base_url, auth_kwargs, inbound_id,
-                                                 client_uuid, unique_email):
+                        ok, err = await _add_client(client, base_url, auth_kwargs, inbound_id,
+                                                    client_uuid, unique_email)
+                        if not ok:
                             await log_error(
                                 "Авто-добавление клиента не удалось",
                                 source="xray_api", server_name=server.get("name"),
-                                level="warning", details=f"inbound={inbound_id}",
+                                level="warning", details=f"inbound={inbound_id}: {err}",
                             )
                             continue
                         real_uuid = client_uuid
 
-                    # Определяем, какой домен отдать клиенту
                     target_host = server.get("client_host") or server["host"]
-
                     host, custom_name, bypass_counter = _resolve_bypass_host(
                         remark, target_host, bypass_ips, bypass_counter,
                     )
