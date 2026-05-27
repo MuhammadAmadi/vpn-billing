@@ -214,10 +214,12 @@ def _resolve_bypass_host(remark: str, server_host: str,
 
 async def _fetch_inbounds(client: httpx.AsyncClient, base_url: str,
                           auth_kwargs: dict, server_name: str) -> list[dict]:
-    resp = await client.get(
-        f"{base_url}/panel/api/inbounds/list",
-        timeout=HTTP_TIMEOUT, **auth_kwargs
-    )
+    url = f"{base_url}/panel/api/inbounds/list"
+    resp = await client.get(url, timeout=HTTP_TIMEOUT, **auth_kwargs)
+    if resp.status_code != 200:
+        log.warning("%s: inbounds/list вернул HTTP %s (url=%s)",
+                    server_name, resp.status_code, url)
+        return []
     inbounds = _safe_json(resp).get("obj") or []
     log.debug("%s: найдено %s inbound(ов)", server_name, len(inbounds))
     return inbounds
@@ -226,21 +228,19 @@ async def _fetch_inbounds(client: httpx.AsyncClient, base_url: str,
 async def _add_client(client: httpx.AsyncClient, base_url: str, auth_kwargs: dict,
                       inbound_id: int, uuid: str, email: str) -> tuple[bool, str]:
     """Возвращает (ok, error_message). error_message пустой при ok=True,
-    иначе содержит причину от панели (msg) или фрагмент ответа."""
+    иначе содержит причину от панели (msg), URL и фрагмент ответа."""
+    url = f"{base_url}/panel/api/inbounds/addClient"
     payload = {"id": inbound_id, "settings": json.dumps(_client_payload(uuid, email))}
     try:
-        resp = await client.post(
-            f"{base_url}/panel/api/inbounds/addClient",
-            json=payload, timeout=HTTP_TIMEOUT, **auth_kwargs
-        )
+        resp = await client.post(url, json=payload, timeout=HTTP_TIMEOUT, **auth_kwargs)
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+        return False, f"{type(e).__name__}: {e} (url={url})"
 
     data = _safe_json(resp)
     if resp.status_code == 200 and data.get("success", False):
         return True, ""
-    panel_msg = data.get("msg") or data.get("message") or (resp.text or "")[:300]
-    return False, f"HTTP {resp.status_code}: {panel_msg}"
+    panel_msg = data.get("msg") or data.get("message") or (resp.text or "")[:200]
+    return False, f"HTTP {resp.status_code} url={url} body={panel_msg!r}"
 
 
 async def add_client_to_all_servers(client_uuid: str, email: str,

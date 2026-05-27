@@ -13,19 +13,26 @@ log = logging.getLogger(__name__)
 
 
 async def get_active_bypass_ips() -> list[str]:
-    """Активные адреса для подстановки в BYPASS-ссылки. Не падает при сбое БД."""
+    """Активные адреса для подстановки в BYPASS-ссылки. Не падает при сбое БД.
+
+    Фолбэк на .env только если в таблице ВООБЩЕ нет записей (значит админ
+    её ещё не настраивал). Если записи есть, но все is_active=FALSE — это
+    осознанное отключение, возвращаем пустой список, чтобы BYPASS-inbound'ы
+    не создавались.
+    """
     try:
         pool = await db.get_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT value FROM bypass_ips WHERE is_active = TRUE ORDER BY sort_order, id"
+                "SELECT value, is_active FROM bypass_ips ORDER BY sort_order, id"
             )
-        if rows:
-            return [r["value"] for r in rows]
-        return list(config.BYPASS_IPS)
     except Exception as e:
         log.warning("Не смог прочитать bypass из БД, использую .env: %s", e)
         return list(config.BYPASS_IPS)
+
+    if not rows:
+        return list(config.BYPASS_IPS)
+    return [r["value"] for r in rows if r["is_active"]]
 
 
 async def list_bypass(conn):
