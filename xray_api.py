@@ -1,4 +1,9 @@
-"""Работа с 3x-ui панелями: добавление/обновление/удаление клиентов, сборка vless-ссылок."""
+"""Работа с 3x-ui панелями: регистрация/обновление/удаление клиентов, сборка vless-ссылок.
+
+Использует новый API под /panel/api/clients/* (3x-ui, версия с клиент-сущностями).
+Bearer-токен указывается в админ-панели сервера. Cookie-авторизация (login/password)
+работает как фолбэк, если токен пустой.
+"""
 
 import asyncio
 import json
@@ -45,8 +50,7 @@ def _skip_for_tariff(remark: str, tariff: str) -> bool:
 
 
 def _should_skip_inbound(remark: str, tariff: str, bypass_ips: list[str]) -> bool:
-    """True — этот inbound нужно полностью пропустить (не звать addClient,
-    не строить ссылку). Учитывает тариф и наличие активных bypass-IP."""
+    """True — этот inbound нужно полностью пропустить (учитывает тариф и наличие bypass-IP)."""
     if _skip_for_tariff(remark, tariff):
         return True
     if _is_bypass(remark) and not bypass_ips:
@@ -55,9 +59,7 @@ def _should_skip_inbound(remark: str, tariff: str, bypass_ips: list[str]) -> boo
 
 
 def _parse_json_field(value, default=None):
-    """3x-ui в разных версиях отдаёт settings/streamSettings то JSON-строкой,
-    то готовым dict-ом. Эта функция нормализует оба варианта и не падает
-    на None / пустой строке / битом JSON — возвращает default ({})."""
+    """settings/streamSettings может прийти JSON-строкой (старый формат) или dict-ом (новый)."""
     if default is None:
         default = {}
     if value is None or value == "":
@@ -86,19 +88,21 @@ def _safe_json(resp) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _quote(s: str) -> str:
+    return urllib.parse.quote(s, safe="")
+
+
 async def get_auth_kwargs(client: httpx.AsyncClient, server: dict) -> dict | None:
     """Возвращает {'headers': {...}, 'cookies': {...}} или None при ошибке."""
-    # Если есть токен, используем его (куки не нужны)
     if server.get("api_token"):
         return {
             "headers": {
                 "Accept": "application/json",
-                "Authorization": f"Bearer {server['api_token']}"
+                "Authorization": f"Bearer {server['api_token']}",
             },
-            "cookies": None
+            "cookies": None,
         }
 
-    # Иначе авторизуемся по старинке через логин/пароль
     base_url = _base_url(server)
     try:
         resp = await client.post(
@@ -180,30 +184,23 @@ def build_vless_link(client_uuid: str, email: str, server_host: str,
 
 
 def _client_payload(uuid: str, email: str) -> dict:
+    """Универсальный payload клиента для /panel/api/clients/add и /update."""
     return {
-        "clients": [{
-            "id": uuid, "email": email,
-            "limitIp": 0, "totalGB": 0, "expiryTime": 0,
-            "enable": True, "flow": "xtls-rprx-vision",
-        }]
+        "id": uuid,
+        "email": email,
+        "totalGB": 0,
+        "expiryTime": 0,
+        "tgId": 0,
+        "limitIp": 0,
+        "enable": True,
+        "flow": "xtls-rprx-vision",
     }
-
-
-def _find_client_uuid(inbound: dict, unique_email: str) -> str | None:
-    """Ищет UUID клиента по email в settings.clients (авторитетный источник).
-    clientStats — это только статистика трафика, поля uuid там нет."""
-    settings = _parse_json_field(inbound.get("settings"))
-    for c in settings.get("clients", []):
-        if c.get("email") == unique_email:
-            return c.get("id")
-    return None
 
 
 def _resolve_bypass_host(remark: str, server_host: str,
                          bypass_ips: list[str], counter: int) -> tuple[str, str | None, int]:
-    """Если inbound помечен как BYPASS — возвращает (адрес из списка, имя 'ОБХОД N', новый счётчик).
-    Пустой bypass_ips сюда не должен попасть: BYPASS-inbound отсеивается раньше
-    через _should_skip_inbound, но на всякий случай делаем фолбэк на server_host."""
+    """Если inbound помечен как BYPASS — возвращает (IP из списка, имя 'ОБХОД N', новый счётчик).
+    Пустой bypass_ips сюда не должен попасть (отсеивается в _should_skip_inbound)."""
     if not _is_bypass(remark):
         return server_host, None, counter
     if not bypass_ips:
@@ -214,6 +211,7 @@ def _resolve_bypass_host(remark: str, server_host: str,
 
 async def _fetch_inbounds(client: httpx.AsyncClient, base_url: str,
                           auth_kwargs: dict, server_name: str) -> list[dict]:
+    """Получает список inbound'ов с clientStats. Логирует не-200 ответы."""
     url = f"{base_url}/panel/api/inbounds/list"
     resp = await client.get(url, timeout=HTTP_TIMEOUT, **auth_kwargs)
     if resp.status_code != 200:
@@ -225,12 +223,46 @@ async def _fetch_inbounds(client: httpx.AsyncClient, base_url: str,
     return inbounds
 
 
+def _has_client_with_email(inbounds: list[dict], email: str) -> bool:
+    """True — на одной из inbound'ов уже есть клиент с таким email."""
+    for inb in inbounds:
+        for stat in inb.get("clientStats") or []:
+            if stat.get("email") == email:
+                return True
+        settings = _parse_json_field(inb.get("settings"))
+        for c in settings.get("clients") or []:
+            if c.get("email") == email:
+                return True
+    return False
+
+
+def _emails_with_uuid(inbounds: list[dict], client_uuid: str) -> set[str]:
+    """Возвращает все email'ы клиентов с указанным UUID (clientStats + settings.clients).
+    Нужно, чтобы при удалении устройства убрать и legacy-клиентов со старым `_iN`-суффиксом."""
+    emails: set[str] = set()
+    for inb in inbounds:
+        for stat in inb.get("clientStats") or []:
+            if stat.get("uuid") == client_uuid:
+                email = stat.get("email")
+                if email:
+                    emails.add(email)
+        settings = _parse_json_field(inb.get("settings"))
+        for c in settings.get("clients") or []:
+            if c.get("id") == client_uuid:
+                email = c.get("email")
+                if email:
+                    emails.add(email)
+    return emails
+
+
 async def _add_client(client: httpx.AsyncClient, base_url: str, auth_kwargs: dict,
-                      inbound_id: int, uuid: str, email: str) -> tuple[bool, str]:
-    """Возвращает (ok, error_message). error_message пустой при ok=True,
-    иначе содержит причину от панели (msg), URL и фрагмент ответа."""
-    url = f"{base_url}/panel/api/inbounds/addClient"
-    payload = {"id": inbound_id, "settings": json.dumps(_client_payload(uuid, email))}
+                      uuid: str, email: str, inbound_ids: list[int]) -> tuple[bool, str]:
+    """POST /panel/api/clients/add — регистрирует клиента и привязывает к inbound'ам.
+    Возвращает (ok, error_message)."""
+    if not inbound_ids:
+        return False, "пустой список inboundIds"
+    url = f"{base_url}/panel/api/clients/add"
+    payload = {"client": _client_payload(uuid, email), "inboundIds": inbound_ids}
     try:
         resp = await client.post(url, json=payload, timeout=HTTP_TIMEOUT, **auth_kwargs)
     except Exception as e:
@@ -240,11 +272,65 @@ async def _add_client(client: httpx.AsyncClient, base_url: str, auth_kwargs: dic
     if resp.status_code == 200 and data.get("success", False):
         return True, ""
     panel_msg = data.get("msg") or data.get("message") or (resp.text or "")[:200]
-    return False, f"HTTP {resp.status_code} url={url} body={panel_msg!r}"
+    return False, f"HTTP {resp.status_code} {panel_msg!r}"
+
+
+async def _update_client(client: httpx.AsyncClient, base_url: str, auth_kwargs: dict,
+                         email: str, new_uuid: str) -> tuple[bool, str]:
+    """POST /panel/api/clients/update/:email — заменяет конфиг клиента (в т.ч. UUID)."""
+    url = f"{base_url}/panel/api/clients/update/{_quote(email)}"
+    payload = _client_payload(new_uuid, email)
+    try:
+        resp = await client.post(url, json=payload, timeout=HTTP_TIMEOUT, **auth_kwargs)
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    data = _safe_json(resp)
+    if resp.status_code == 200 and data.get("success", False):
+        return True, ""
+    panel_msg = data.get("msg") or data.get("message") or (resp.text or "")[:200]
+    return False, f"HTTP {resp.status_code} {panel_msg!r}"
+
+
+async def _delete_client(client: httpx.AsyncClient, base_url: str, auth_kwargs: dict,
+                         email: str) -> tuple[bool, str]:
+    """POST /panel/api/clients/del/:email — удаляет клиента со всех привязанных inbound'ов."""
+    url = f"{base_url}/panel/api/clients/del/{_quote(email)}"
+    try:
+        resp = await client.post(url, timeout=HTTP_TIMEOUT, **auth_kwargs)
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    data = _safe_json(resp)
+    if resp.status_code == 200 and data.get("success", False):
+        return True, ""
+    panel_msg = data.get("msg") or data.get("message") or (resp.text or "")[:200]
+    return False, f"HTTP {resp.status_code} {panel_msg!r}"
+
+
+def _eligible_inbounds(inbounds: list[dict], tariff: str, bypass_ips: list[str]) -> list[dict]:
+    return [
+        inb for inb in inbounds
+        if not _should_skip_inbound(inb.get("remark", ""), tariff, bypass_ips)
+    ]
+
+
+def _build_links(client_uuid: str, email: str, server: dict, eligible: list[dict],
+                 bypass_ips: list[str], bypass_counter: int) -> tuple[list[str], int]:
+    """Собирает vless-ссылки для всех eligible inbound'ов, возвращает (links, обновлённый счётчик)."""
+    links: list[str] = []
+    target_host = server.get("client_host") or server["host"]
+    for inbound in eligible:
+        remark = inbound.get("remark", "")
+        host, custom_name, bypass_counter = _resolve_bypass_host(
+            remark, target_host, bypass_ips, bypass_counter,
+        )
+        links.append(build_vless_link(client_uuid, email, host, inbound, custom_name))
+    return links, bypass_counter
 
 
 async def add_client_to_all_servers(client_uuid: str, email: str,
                                     tariff: str = "Standard") -> list[str]:
+    """Регистрирует клиента на всех серверах одним POST /clients/add на сервер
+    (привязка ко всем подходящим inbound'ам сразу) и возвращает список ссылок."""
     gathered_links: list[str] = []
     bypass_counter = 0
     bypass_ips = await get_active_bypass_ips()
@@ -253,36 +339,31 @@ async def add_client_to_all_servers(client_uuid: str, email: str,
     async with httpx.AsyncClient(verify=False) as client:
         for server in servers:
             base_url = _base_url(server)
-            auth_kwargs = await get_auth_kwargs(client, server)  # Изменено
-
-            if not auth_kwargs:  # Изменено
+            auth_kwargs = await get_auth_kwargs(client, server)
+            if not auth_kwargs:
                 log.warning("Пропускаю %s — нет авторизации", server["name"])
                 continue
             try:
                 inbounds = await _fetch_inbounds(client, base_url, auth_kwargs, server["name"])
-                for inbound in inbounds:
-                    remark = inbound.get("remark", "")
-                    if _should_skip_inbound(remark, tariff, bypass_ips):
-                        continue
-                    inbound_id = inbound.get("id")
-                    unique_email = f"{email}_i{inbound_id}"
+                eligible = _eligible_inbounds(inbounds, tariff, bypass_ips)
+                if not eligible:
+                    continue
 
-                    ok, err = await _add_client(client, base_url, auth_kwargs, inbound_id,
-                                                client_uuid, unique_email)
-                    if not ok:
-                        await log_error(
-                            "addClient вернул ошибку",
-                            source="xray_api", server_name=server.get("name"),
-                            level="warning", details=f"inbound={inbound_id}: {err}",
-                        )
-                        continue
-
-                    target_host = server.get("client_host") or server["host"]
-                    host, custom_name, bypass_counter = _resolve_bypass_host(
-                        remark, target_host, bypass_ips, bypass_counter,
+                inbound_ids = [inb["id"] for inb in eligible]
+                ok, err = await _add_client(client, base_url, auth_kwargs,
+                                            client_uuid, email, inbound_ids)
+                if not ok:
+                    await log_error(
+                        "Не удалось зарегистрировать клиента",
+                        source="xray_api", server_name=server.get("name"),
+                        level="warning", details=f"inbounds={inbound_ids}: {err}",
                     )
-                    link = build_vless_link(client_uuid, unique_email, host, inbound, custom_name)
-                    gathered_links.append(link)
+                    continue
+
+                links, bypass_counter = _build_links(
+                    client_uuid, email, server, eligible, bypass_ips, bypass_counter,
+                )
+                gathered_links.extend(links)
             except Exception as e:
                 log.error("Ошибка Xray на %s: %s", server["name"], e)
                 await log_error(
@@ -296,27 +377,25 @@ async def add_client_to_all_servers(client_uuid: str, email: str,
 
 
 async def remove_client_from_all_servers(client_uuid: str) -> None:
+    """Удаляет все клиенты с указанным UUID со всех серверов.
+    Ищет email'ы в clientStats/settings.clients — поддерживает и legacy-формат
+    с `_iN`-суффиксами в email'е (несколько записей на одно устройство)."""
     servers = await get_active_servers()
     async with httpx.AsyncClient(verify=False) as client:
         for server in servers:
             base_url = _base_url(server)
-            auth_kwargs = await get_auth_kwargs(client, server)  # Изменено
-
-            if not auth_kwargs:  # Изменено
+            auth_kwargs = await get_auth_kwargs(client, server)
+            if not auth_kwargs:
                 continue
             try:
                 inbounds = await _fetch_inbounds(client, base_url, auth_kwargs, server["name"])
-                for inbound in inbounds:
-                    inbound_id = inbound["id"]
-                    settings = _parse_json_field(inbound.get("settings"))
-                    if not any(c.get("id") == client_uuid for c in settings.get("clients", [])):
-                        continue
-
-                    await client.post(
-                        f"{base_url}/panel/api/inbounds/{inbound_id}/delClient/{client_uuid}",
-                        timeout=HTTP_TIMEOUT, **auth_kwargs
-                    )
-                    log.debug("delClient %s inbound=%s", server["name"], inbound_id)
+                emails = _emails_with_uuid(inbounds, client_uuid)
+                for email in emails:
+                    ok, err = await _delete_client(client, base_url, auth_kwargs, email)
+                    if ok:
+                        log.debug("delClient %s email=%s", server["name"], email)
+                    else:
+                        log.info("%s: delete %s: %s", server["name"], email, err)
             except Exception as e:
                 log.error("Ошибка удаления Xray на %s: %s", server["name"], e)
                 await log_error(
@@ -326,40 +405,41 @@ async def remove_client_from_all_servers(client_uuid: str) -> None:
                 )
 
 
-async def update_client_uuid_on_all_servers(old_uuid: str, new_uuid: str, email: str) -> None:
+async def update_client_uuid_on_all_servers(old_uuid: str, new_uuid: str, email: str,
+                                            tariff: str = "Standard") -> None:
+    """Меняет UUID клиента на всех серверах. old_uuid сохранён в сигнатуре
+    для совместимости с вызовами — фактически используется email для поиска.
+    Если клиента ещё нет (новая панель / устройство переезжает) — фолбэк на add."""
+    bypass_ips = await get_active_bypass_ips()
     servers = await get_active_servers()
     async with httpx.AsyncClient(verify=False) as client:
         for server in servers:
             base_url = _base_url(server)
-            auth_kwargs = await get_auth_kwargs(client, server)  # Изменено
-
-            if not auth_kwargs:  # Изменено
+            auth_kwargs = await get_auth_kwargs(client, server)
+            if not auth_kwargs:
                 continue
-
             try:
-                inbounds = await _fetch_inbounds(client, base_url, auth_kwargs, server["name"])
-                for inbound in inbounds:
-                    remark = inbound.get("remark", "")
-                    if _is_private(remark) or _is_premium(remark):
-                        continue
-                    inbound_id = inbound["id"]
-                    unique_email = f"{email}_i{inbound_id}"
-                    real_uuid = _find_client_uuid(inbound, unique_email)
-                    payload = {"id": inbound_id, "settings": json.dumps(_client_payload(new_uuid, unique_email))}
-                    if not real_uuid:
-                        log.info("%s: %s не найден, добавляю заново", server["name"], unique_email)
-                        await client.post(
-                            f"{base_url}/panel/api/inbounds/addClient",
-                            json=payload, timeout=HTTP_TIMEOUT, **auth_kwargs
-                        )
-                        continue
+                ok, err = await _update_client(client, base_url, auth_kwargs, email, new_uuid)
+                if ok:
+                    log.debug("updateClient %s email=%s → uuid=%s",
+                              server["name"], email, new_uuid)
+                    continue
 
-                    await client.post(
-                        f"{base_url}/panel/api/inbounds/updateClient/{real_uuid}",
-                        json=payload, timeout=HTTP_TIMEOUT, **auth_kwargs
+                log.info("%s: update %s не удался (%s) — пробую add", server["name"], email, err)
+                inbounds = await _fetch_inbounds(client, base_url, auth_kwargs, server["name"])
+                eligible = _eligible_inbounds(inbounds, tariff, bypass_ips)
+                if not eligible:
+                    continue
+                inbound_ids = [inb["id"] for inb in eligible]
+                ok2, err2 = await _add_client(
+                    client, base_url, auth_kwargs, new_uuid, email, inbound_ids,
+                )
+                if not ok2:
+                    await log_error(
+                        "Не удалось обновить ключ клиента",
+                        source="xray_api", server_name=server.get("name"),
+                        level="warning", details=f"update_err={err}; add_err={err2}",
                     )
-                    log.debug("updateClient %s inbound=%s: %s → %s",
-                              server["name"], inbound_id, real_uuid, new_uuid)
             except Exception as e:
                 log.error("Ошибка updateClient на %s: %s", server["name"], e)
                 await log_error(
@@ -371,6 +451,8 @@ async def update_client_uuid_on_all_servers(old_uuid: str, new_uuid: str, email:
 
 async def get_client_links_from_all_servers(client_uuid: str, email: str,
                                             tariff: str = "Standard") -> list[str]:
+    """Собирает текущие ссылки для клиента. Если клиента ещё нет на сервере —
+    регистрирует одним вызовом /clients/add."""
     gathered_links: list[str] = []
     bypass_counter = 0
     bypass_ips = await get_active_bypass_ips()
@@ -379,39 +461,33 @@ async def get_client_links_from_all_servers(client_uuid: str, email: str,
     async with httpx.AsyncClient(verify=False) as client:
         for server in servers:
             base_url = _base_url(server)
-            auth_kwargs = await get_auth_kwargs(client, server)  # Изменено
-
-            if not auth_kwargs:  # Изменено
+            auth_kwargs = await get_auth_kwargs(client, server)
+            if not auth_kwargs:
                 continue
             try:
                 inbounds = await _fetch_inbounds(client, base_url, auth_kwargs, server["name"])
-                for inbound in inbounds:
-                    remark = inbound.get("remark", "")
-                    if _should_skip_inbound(remark, tariff, bypass_ips):
-                        continue
-                    inbound_id = inbound["id"]
-                    unique_email = f"{email}_i{inbound_id}"
-                    real_uuid = _find_client_uuid(inbound, unique_email)
+                eligible = _eligible_inbounds(inbounds, tariff, bypass_ips)
+                if not eligible:
+                    continue
 
-                    if not real_uuid:
-                        log.info("%s: %s не найден на сервере, добавляю", server["name"], unique_email)
-                        ok, err = await _add_client(client, base_url, auth_kwargs, inbound_id,
-                                                    client_uuid, unique_email)
-                        if not ok:
-                            await log_error(
-                                "Авто-добавление клиента не удалось",
-                                source="xray_api", server_name=server.get("name"),
-                                level="warning", details=f"inbound={inbound_id}: {err}",
-                            )
-                            continue
-                        real_uuid = client_uuid
-
-                    target_host = server.get("client_host") or server["host"]
-                    host, custom_name, bypass_counter = _resolve_bypass_host(
-                        remark, target_host, bypass_ips, bypass_counter,
+                if not _has_client_with_email(inbounds, email):
+                    log.info("%s: %s не найден, добавляю", server["name"], email)
+                    inbound_ids = [inb["id"] for inb in eligible]
+                    ok, err = await _add_client(
+                        client, base_url, auth_kwargs, client_uuid, email, inbound_ids,
                     )
-                    link = build_vless_link(client_uuid, unique_email, host, inbound, custom_name)
-                    gathered_links.append(link)
+                    if not ok:
+                        await log_error(
+                            "Авто-добавление клиента не удалось",
+                            source="xray_api", server_name=server.get("name"),
+                            level="warning", details=f"inbounds={inbound_ids}: {err}",
+                        )
+                        continue
+
+                links, bypass_counter = _build_links(
+                    client_uuid, email, server, eligible, bypass_ips, bypass_counter,
+                )
+                gathered_links.extend(links)
             except Exception as e:
                 log.error("Ошибка getLinks на %s: %s", server["name"], e)
                 await log_error(
@@ -434,7 +510,7 @@ async def test_server(server: dict) -> tuple[bool, str]:
             lst = await client.get(
                 f"{base_url}/panel/api/inbounds/list",
                 timeout=HTTP_TIMEOUT,
-                **auth_kwargs
+                **auth_kwargs,
             )
             data = _safe_json(lst)
             if lst.status_code == 200 and data.get("success"):
