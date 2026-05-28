@@ -25,6 +25,16 @@ PRIVATE_MARK = "| PRIVATE"
 BYPASS_MARK = "BYPASS"
 PREMIUM_MARKS = ("| VIP", "| PRO")
 
+# ────────── 3x-ui REST API ──────────
+# Эндпоинты вынесены сюда, чтобы при апдейте панели править их в одном месте.
+# Это работает, пока меняются только пути; если в новой версии меняется ещё и
+# форма payload'а — придётся править соответствующие _add/_update/_delete функции.
+URL_LOGIN = "/login"
+URL_INBOUNDS_LIST = "/panel/api/inbounds/list"
+URL_CLIENT_ADD = "/panel/api/clients/add"
+URL_CLIENT_UPDATE = "/panel/api/clients/update/{email}"
+URL_CLIENT_DELETE = "/panel/api/clients/del/{email}"
+
 
 def _base_url(server: dict) -> str:
     return f"{server['scheme']}://{server['host']}:{server['port']}/{server['base_path'].strip('/')}"
@@ -106,7 +116,7 @@ async def get_auth_kwargs(client: httpx.AsyncClient, server: dict) -> dict | Non
     base_url = _base_url(server)
     try:
         resp = await client.post(
-            f"{base_url}/login",
+            f"{base_url}{URL_LOGIN}",
             json={"username": server.get("login", ""), "password": server.get("password", "")},
             timeout=HTTP_TIMEOUT,
         )
@@ -212,7 +222,7 @@ def _resolve_bypass_host(remark: str, server_host: str,
 async def _fetch_inbounds(client: httpx.AsyncClient, base_url: str,
                           auth_kwargs: dict, server_name: str) -> list[dict]:
     """Получает список inbound'ов с clientStats. Логирует не-200 ответы."""
-    url = f"{base_url}/panel/api/inbounds/list"
+    url = f"{base_url}{URL_INBOUNDS_LIST}"
     resp = await client.get(url, timeout=HTTP_TIMEOUT, **auth_kwargs)
     if resp.status_code != 200:
         log.warning("%s: inbounds/list вернул HTTP %s (url=%s)",
@@ -261,7 +271,7 @@ async def _add_client(client: httpx.AsyncClient, base_url: str, auth_kwargs: dic
     Возвращает (ok, error_message)."""
     if not inbound_ids:
         return False, "пустой список inboundIds"
-    url = f"{base_url}/panel/api/clients/add"
+    url = f"{base_url}{URL_CLIENT_ADD}"
     payload = {"client": _client_payload(uuid, email), "inboundIds": inbound_ids}
     try:
         resp = await client.post(url, json=payload, timeout=HTTP_TIMEOUT, **auth_kwargs)
@@ -278,7 +288,7 @@ async def _add_client(client: httpx.AsyncClient, base_url: str, auth_kwargs: dic
 async def _update_client(client: httpx.AsyncClient, base_url: str, auth_kwargs: dict,
                          email: str, new_uuid: str) -> tuple[bool, str]:
     """POST /panel/api/clients/update/:email — заменяет конфиг клиента (в т.ч. UUID)."""
-    url = f"{base_url}/panel/api/clients/update/{_quote(email)}"
+    url = f"{base_url}{URL_CLIENT_UPDATE.format(email=_quote(email))}"
     payload = _client_payload(new_uuid, email)
     try:
         resp = await client.post(url, json=payload, timeout=HTTP_TIMEOUT, **auth_kwargs)
@@ -294,7 +304,7 @@ async def _update_client(client: httpx.AsyncClient, base_url: str, auth_kwargs: 
 async def _delete_client(client: httpx.AsyncClient, base_url: str, auth_kwargs: dict,
                          email: str) -> tuple[bool, str]:
     """POST /panel/api/clients/del/:email — удаляет клиента со всех привязанных inbound'ов."""
-    url = f"{base_url}/panel/api/clients/del/{_quote(email)}"
+    url = f"{base_url}{URL_CLIENT_DELETE.format(email=_quote(email))}"
     try:
         resp = await client.post(url, timeout=HTTP_TIMEOUT, **auth_kwargs)
     except Exception as e:
@@ -508,7 +518,7 @@ async def test_server(server: dict) -> tuple[bool, str]:
                 return False, "Авторизация не удалась (проверьте логин/пароль или токен)"
 
             lst = await client.get(
-                f"{base_url}/panel/api/inbounds/list",
+                f"{base_url}{URL_INBOUNDS_LIST}",
                 timeout=HTTP_TIMEOUT,
                 **auth_kwargs,
             )
