@@ -92,9 +92,16 @@ async def check_channel_subscription(bot: Bot, user_id: int) -> bool:
 
 
 async def ensure_user(conn, user_id: int, username: str) -> None:
+    """Создаёт юзера или «оживляет» после soft-delete / попадания в неактивные.
+    bonus_given / phone_bonus_given не сбрасываются — повторный бонус не выдаётся."""
     await conn.execute(
         """INSERT INTO users (user_id, username) VALUES ($1, $2)
-           ON CONFLICT (user_id) DO NOTHING""",
+           ON CONFLICT (user_id) DO UPDATE
+              SET username = EXCLUDED.username,
+                  is_deleted = FALSE,
+                  is_inactive = FALSE,
+                  broadcast_failures = 0,
+                  inactive_since = NULL""",
         user_id, username,
     )
 

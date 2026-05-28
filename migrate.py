@@ -125,12 +125,18 @@ ALTERS = [
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(50);",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS bonus_given BOOLEAN DEFAULT FALSE;",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_bonus_given BOOLEAN DEFAULT FALSE;",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE;",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_inactive BOOLEAN NOT NULL DEFAULT FALSE;",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS inactive_since TIMESTAMP;",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS broadcast_failures INTEGER NOT NULL DEFAULT 0;",
     "ALTER TABLE servers ADD COLUMN IF NOT EXISTS api_token VARCHAR(255) NOT NULL DEFAULT '';",
     "ALTER TABLE servers ADD COLUMN IF NOT EXISTS client_host VARCHAR(255) NOT NULL DEFAULT '';",
 ]
 
 INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_users_magic_token ON users(magic_token);",
+    "CREATE INDEX IF NOT EXISTS idx_users_is_deleted ON users(is_deleted) WHERE is_deleted = FALSE;",
+    "CREATE INDEX IF NOT EXISTS idx_users_is_inactive ON users(is_inactive) WHERE is_inactive = TRUE;",
     "CREATE INDEX IF NOT EXISTS idx_devices_user_id ON devices(user_id);",
     "CREATE INDEX IF NOT EXISTS idx_transactions_user_id ON transactions(user_id);",
     "CREATE INDEX IF NOT EXISTS idx_transactions_type_created ON transactions(type, created_at);",

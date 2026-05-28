@@ -25,6 +25,8 @@ SORT_MAP = {
     "devices":      "q.device_count DESC, q.user_id DESC",
     "newest":       "q.created_ts DESC",
     "oldest":       "q.created_ts ASC",
+    "inactive":     "q.is_inactive DESC, q.broadcast_failures DESC, q.user_id DESC",
+    "failures":     "q.broadcast_failures DESC, q.user_id DESC",
 }
 
 # Фильтры по статусу. daily_cost = устройства × PRICE_PER_DEVICE.
@@ -34,6 +36,7 @@ STATUS_MAP = {
     "stopped":      "q.device_count > 0 AND q.balance <  q.device_count * $price",
     "with_devices": "q.device_count > 0",
     "no_devices":   "q.device_count = 0",
+    "inactive":     "q.is_inactive = TRUE",
 }
 
 # Внутренний запрос: считает всю статистику по каждому пользователю.
@@ -66,6 +69,9 @@ SELECT u.user_id,
        u.balance::float8                                   AS balance,
        TO_CHAR(u.created_at, 'DD.MM.YYYY')                 AS created,
        CAST(EXTRACT(EPOCH FROM u.created_at) AS BIGINT)    AS created_ts,
+       u.is_inactive,
+       TO_CHAR(u.inactive_since, 'DD.MM.YYYY HH24:MI')      AS inactive_since,
+       u.broadcast_failures,
        COALESCE(inc.topup_count, 0)                        AS topup_count,
        COALESCE(inc.topup_total, 0)::float8               AS topup_total,
        COALESCE(streak.topup_streak, 0)                    AS topup_streak,
@@ -74,6 +80,7 @@ FROM users u
 LEFT JOIN inc    ON inc.user_id    = u.user_id
 LEFT JOIN streak ON streak.user_id = u.user_id
 LEFT JOIN dev    ON dev.user_id    = u.user_id
+WHERE u.is_deleted = FALSE
 """
 
 
@@ -172,12 +179,112 @@ async def export_users(conn, *, search: str = "", status: str = "all",
     return [dict(r) for r in rows]
 
 
+async def delete_device(conn, user_id, device_id) -> dict | None:
+    """Удаляет устройство из БД. VPN-панели чистятся в admin_panel перед вызовом.
+    Возвращает строку устройства, если оно найдено и удалено."""
+    row = await conn.fetchrow(
+        "SELECT id, short_id, name, os FROM devices WHERE id = $1 AND user_id = $2",
+        str(device_id), int(user_id),
+    )
+    if not row:
+        return None
+    async with conn.transaction():
+        await conn.execute(
+            "DELETE FROM devices WHERE id = $1 AND user_id = $2",
+            str(device_id), int(user_id),
+        )
+        await conn.execute(
+            """INSERT INTO transactions (user_id, type, title, description)
+               VALUES ($1, 'action', 'Устройство удалено (админ)', $2)""",
+            int(user_id), f"ID {row['short_id']} {row['name'] or ''} ({row['os'] or ''})".strip(),
+        )
+    return dict(row)
+
+
+async def soft_delete_user(conn, user_id) -> list[str]:
+    """Помечает пользователя удалённым (is_deleted=TRUE) и удаляет его устройства из БД.
+    bonus_given / phone_bonus_given сохраняются — при возврате клиент бонус не получит.
+    Возвращает список device_id, которые нужно убрать с VPN-панелей (вызвать снаружи)."""
+    device_ids = [
+        r["id"] for r in await conn.fetch(
+            "SELECT id FROM devices WHERE user_id = $1", int(user_id),
+        )
+    ]
+    async with conn.transaction():
+        await conn.execute("DELETE FROM devices WHERE user_id = $1", int(user_id))
+        # Анонимизируем PII, bonus_given/phone_bonus_given оставляем как есть
+        await conn.execute(
+            """UPDATE users
+                  SET is_deleted = TRUE,
+                      phone = NULL,
+                      magic_token = NULL,
+                      balance = 0,
+                      is_inactive = FALSE,
+                      inactive_since = NULL
+                WHERE user_id = $1""",
+            int(user_id),
+        )
+        await conn.execute(
+            """INSERT INTO transactions (user_id, type, title, description)
+               VALUES ($1, 'action', 'Аккаунт удалён (админ)',
+                       'soft-delete: TG ID сохранён, бонусы повторно не выдаются')""",
+            int(user_id),
+        )
+    return device_ids
+
+
+async def mark_inactive(conn, user_id: int) -> None:
+    """Помечает пользователя как недоступного для рассылки (бот заблокирован/аккаунт удалён)."""
+    await conn.execute(
+        """UPDATE users
+              SET is_inactive = TRUE,
+                  inactive_since = COALESCE(inactive_since, NOW()),
+                  broadcast_failures = broadcast_failures + 1
+            WHERE user_id = $1""",
+        int(user_id),
+    )
+
+
+async def bump_broadcast_failure(conn, user_id: int, threshold: int = 3) -> bool:
+    """Инкрементит счётчик неудач рассылки. Возвращает True, если после инкремента
+    пользователь стал неактивным (порог достигнут)."""
+    new_count = await conn.fetchval(
+        """UPDATE users
+              SET broadcast_failures = broadcast_failures + 1
+            WHERE user_id = $1
+        RETURNING broadcast_failures""",
+        int(user_id),
+    )
+    if new_count is not None and new_count >= threshold:
+        await conn.execute(
+            """UPDATE users SET is_inactive = TRUE,
+                                inactive_since = COALESCE(inactive_since, NOW())
+                WHERE user_id = $1 AND is_inactive = FALSE""",
+            int(user_id),
+        )
+        return True
+    return False
+
+
+async def reset_inactive(conn, user_id: int) -> None:
+    """Сбрасывает флаг неактивности (если пользователь вернулся и пишет боту)."""
+    await conn.execute(
+        """UPDATE users SET is_inactive = FALSE,
+                            inactive_since = NULL,
+                            broadcast_failures = 0
+            WHERE user_id = $1""",
+        int(user_id),
+    )
+
+
 async def get_user_detail(conn, user_id) -> dict | None:
     """Полная карточка: данные + устройства + история транзакций."""
     user = await conn.fetchrow(
         """SELECT user_id, username, phone, balance::float8 AS balance, magic_token,
+                  is_inactive, broadcast_failures,
+                  TO_CHAR(inactive_since, 'DD.MM.YYYY HH24:MI') AS inactive_since,
                   TO_CHAR(created_at, 'DD.MM.YYYY') AS created
-           FROM users WHERE user_id = $1""",
+           FROM users WHERE user_id = $1 AND is_deleted = FALSE""",
         int(user_id),
     )
     if not user:

@@ -251,6 +251,61 @@ async def api_user_balance(request: Request):
         return {"status": "error", "msg": str(e)}
 
 
+@router.post("/api/device/delete")
+async def api_device_delete(request: Request):
+    """Удаление устройства из админки: сначала чистим VPN-панели, потом БД."""
+    if not _is_authed(request):
+        return _need_login_json()
+    data = await request.json()
+    uid = data.get("user_id")
+    device_id = data.get("device_id")
+    if not uid or not device_id:
+        return {"status": "error", "msg": "Нужны user_id и device_id"}
+    try:
+        try:
+            await xray_api.remove_client_from_all_servers(str(device_id))
+        except Exception as e:
+            await error_log.log_error(
+                "Удаление с VPN-панели не удалось (продолжаю чистку БД)",
+                source="admin_panel", level="warning",
+                details=f"device_id={device_id}: {type(e).__name__}: {e}",
+            )
+        async with request.app.state.db.acquire() as conn:
+            row = await users_store.delete_device(conn, uid, device_id)
+        if not row:
+            return {"status": "error", "msg": "Устройство не найдено у этого пользователя"}
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "msg": str(e)}
+
+
+@router.post("/api/user/delete")
+async def api_user_delete(request: Request):
+    """Soft-delete аккаунта: TG ID + bonus_given сохраняются, устройства удаляются."""
+    if not _is_authed(request):
+        return _need_login_json()
+    data = await request.json()
+    uid = data.get("user_id")
+    if not uid:
+        return {"status": "error", "msg": "Нужен user_id"}
+    try:
+        async with request.app.state.db.acquire() as conn:
+            device_ids = await users_store.soft_delete_user(conn, uid)
+        # Чистим VPN-панели (вне транзакции — сетевые вызовы могут быть медленными)
+        for did in device_ids:
+            try:
+                await xray_api.remove_client_from_all_servers(str(did))
+            except Exception as e:
+                await error_log.log_error(
+                    "Удаление клиента с VPN при soft-delete юзера не удалось",
+                    source="admin_panel", level="warning",
+                    details=f"user_id={uid} device_id={did}: {type(e).__name__}: {e}",
+                )
+        return {"status": "ok", "removed_devices": len(device_ids)}
+    except Exception as e:
+        return {"status": "error", "msg": str(e)}
+
+
 # ──────────── BYPASS ────────────
 @router.get("/api/bypass")
 async def api_bypass_list(request: Request):
@@ -552,11 +607,14 @@ DASHBOARD_HTML = """<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">
         <option value="all">Все статусы</option><option value="active">Активные</option>
         <option value="stopped">Остановленные</option><option value="with_devices">С устройствами</option>
         <option value="no_devices">Без устройств</option>
+        <option value="inactive">Неактивные (бот заблокирован)</option>
       </select>
       <select id="u-sort" onchange="applyUsers()" class="bg-gray-800 border border-gray-700 rounded-lg px-2 py-2 text-sm">
         <option value="topup_total">Сумма пополнений ↓</option><option value="topup_count">Кол-во пополнений ↓</option>
         <option value="topup_streak">Серия пополнений ↓</option><option value="balance">Баланс ↓</option>
         <option value="devices">Устройства ↓</option><option value="newest">Новые</option><option value="oldest">Старые</option>
+        <option value="inactive">Неактивные сверху</option>
+        <option value="failures">Ошибки рассылки ↓</option>
       </select>
       <select id="u-size" onchange="applyUsers()" class="bg-gray-800 border border-gray-700 rounded-lg px-2 py-2 text-sm">
         <option value="25">25</option><option value="50">50</option><option value="100">100</option>
@@ -941,11 +999,12 @@ async function loadUsers(){
   if(!users.length){tb.innerHTML='<tr><td colspan="8" class="text-gray-500 text-center py-8">Ничего не найдено</td></tr>';}
   else tb.innerHTML=users.map(u=>{
     const active=u.device_count>0&&u.balance>=u.device_count*3.33;
-    const dot=u.device_count===0?'bg-gray-600':(active?'bg-green-500':'bg-red-500');
+    const dot=u.is_inactive?'bg-orange-500':(u.device_count===0?'bg-gray-600':(active?'bg-green-500':'bg-red-500'));
+    const inactiveBadge=u.is_inactive?`<span class="ml-1 inline-block bg-orange-500/20 text-orange-400 text-[10px] px-1.5 py-0.5 rounded font-semibold uppercase" title="Ошибок рассылки: ${u.broadcast_failures||0}"><i class="fa-solid fa-ban mr-0.5"></i>заблок.</span>`:'';
     const name=u.username?'@'+esc(u.username):'—';
     return `<tr onclick="openUserDetail(${u.user_id})" class="border-t border-gray-700/60 hover:bg-gray-700/30 cursor-pointer">
       <td class="px-4 py-3"><div class="flex items-center gap-2"><span class="w-2 h-2 rounded-full ${dot}"></span>
-        <div><div class="font-semibold">${name}</div><div class="text-xs text-gray-500 font-mono">${u.user_id}${u.phone?' · '+esc(u.phone):''}</div></div></div></td>
+        <div><div class="font-semibold">${name}${inactiveBadge}</div><div class="text-xs text-gray-500 font-mono">${u.user_id}${u.phone?' · '+esc(u.phone):''}</div></div></div></td>
       <td class="px-3 py-3 text-right font-bold ${u.balance<=0?'text-red-400':''}">${u.balance.toFixed(2)}</td>
       <td class="px-3 py-3 text-right text-green-400">${u.topup_total.toFixed(0)}₽</td>
       <td class="px-3 py-3 text-right text-gray-300">${u.topup_count}</td>
@@ -983,7 +1042,10 @@ async function openUserDetail(uid){
       <div class="flex items-center justify-between gap-2"><div class="flex items-center gap-2 min-w-0">
         <i class="fa-brands ${ic}"></i><div class="min-w-0"><div class="font-semibold text-sm truncate">${esc(d.short_id)} ${esc(d.name||'')}</div>
         <div class="text-xs text-gray-500">${esc(d.os||'')} · ${esc(d.created)}</div></div></div>
-        <button onclick="copyText('${encodeURIComponent(d.sub_url)}',this)" class="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded-lg flex-shrink-0"><i class="fa-regular fa-copy"></i> ссылка</button></div></div>`;
+        <div class="flex items-center gap-1 flex-shrink-0">
+          <button onclick="copyText('${encodeURIComponent(d.sub_url)}',this)" class="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded-lg"><i class="fa-regular fa-copy"></i> ссылка</button>
+          <button onclick="deleteDevice(${u.user_id},'${esc(d.id)}','${esc(d.short_id)}')" class="text-xs bg-red-600/20 text-red-400 hover:bg-red-600/30 px-2 py-1 rounded-lg" title="Удалить устройство"><i class="fa-solid fa-trash-can"></i></button>
+        </div></div></div>`;
   }).join(''):'<div class="text-gray-500 text-sm py-2">Устройств нет</div>';
   const histHtml=(j.history||[]).length?j.history.map(h=>{
     const ic=h.type==='income'?'text-green-400 fa-arrow-down':h.type==='expense'?'text-red-400 fa-arrow-up':'text-blue-400 fa-microchip';
@@ -993,17 +1055,34 @@ async function openUserDetail(uid){
       <div class="text-sm font-bold flex-shrink-0">${esc(h.amount||'')}</div></div>`;
   }).join(''):'<div class="text-gray-500 text-sm py-2">Истории нет</div>';
   const cab=u.cabinet_url?`<a href="${esc(u.cabinet_url)}" target="_blank" class="text-blue-400 text-xs hover:underline"><i class="fa-solid fa-up-right-from-square mr-1"></i>кабинет</a>`:'';
+  const inact=u.is_inactive?`<div class="text-xs text-orange-400 mt-1"><i class="fa-solid fa-ban mr-1"></i>Бот заблокирован/аккаунт удалён${u.inactive_since?' · с '+esc(u.inactive_since):''}${u.broadcast_failures?' · ошибок: '+u.broadcast_failures:''}</div>`:'';
   document.getElementById('detail-body').innerHTML=`
     <div class="bg-gray-900/60 rounded-2xl p-4 border border-gray-700 mb-4">
       <div class="flex justify-between items-start">
         <div><div class="font-bold text-lg">${u.username?'@'+esc(u.username):'—'}</div>
         <div class="text-xs text-gray-500 font-mono">ID ${u.user_id}${u.phone?' · '+esc(u.phone):''}</div>
-        <div class="text-xs text-gray-500 mt-0.5">Регистрация: ${esc(u.created)} ${cab}</div></div>
+        <div class="text-xs text-gray-500 mt-0.5">Регистрация: ${esc(u.created)} ${cab}</div>
+        ${inact}</div>
         <div class="text-right"><div class="text-2xl font-bold ${u.balance<=0?'text-red-400':'text-green-400'}">${u.balance.toFixed(2)}₽</div>
-        <button onclick="openBalance(${u.user_id})" class="mt-1 text-xs bg-blue-500/20 text-blue-400 hover:bg-blue-500/30 px-3 py-1 rounded-lg font-semibold"><i class="fa-solid fa-wallet mr-1"></i>изменить</button></div>
+        <div class="mt-1 flex gap-1 justify-end">
+          <button onclick="openBalance(${u.user_id})" class="text-xs bg-blue-500/20 text-blue-400 hover:bg-blue-500/30 px-3 py-1 rounded-lg font-semibold"><i class="fa-solid fa-wallet mr-1"></i>баланс</button>
+          <button onclick="deleteAccount(${u.user_id})" class="text-xs bg-red-600/20 text-red-400 hover:bg-red-600/30 px-3 py-1 rounded-lg font-semibold" title="Soft-delete: TG ID сохранится для проверки бонусов"><i class="fa-solid fa-user-slash mr-1"></i>удалить</button>
+        </div></div>
       </div></div>
     <h4 class="text-sm font-bold text-gray-400 uppercase tracking-wider mb-2">Устройства (${(j.devices||[]).length})</h4>${devHtml}
     <h4 class="text-sm font-bold text-gray-400 uppercase tracking-wider mb-2 mt-4">История</h4>${histHtml}`;
+}
+
+async function deleteDevice(uid, deviceId, shortId){
+  if(!confirm('Удалить устройство '+shortId+'?\n\nКлиент будет удалён со всех VPN-панелей и из БД.'))return;
+  const j=await(await fetch('/admin/api/device/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:uid,device_id:deviceId})})).json();
+  if(j.status==='ok'){openUserDetail(uid);loadUsers();}else alert(j.msg||'Ошибка');
+}
+
+async function deleteAccount(uid){
+  if(!confirm('Удалить аккаунт пользователя?\n\nTG ID и флаг bonus_given сохранятся — повторный бонус клиент не получит.\nУстройства будут удалены с VPN-панелей и из БД.\nЭто действие необратимо.'))return;
+  const j=await(await fetch('/admin/api/user/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:uid})})).json();
+  if(j.status==='ok'){closeModal();loadUsers();alert('Аккаунт удалён. Устройств снято: '+(j.removed_devices||0));}else alert(j.msg||'Ошибка');
 }
 
 /* ---- BYPASS ---- */
