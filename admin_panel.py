@@ -1074,13 +1074,13 @@ async function openUserDetail(uid){
 }
 
 async function deleteDevice(uid, deviceId, shortId){
-  if(!confirm('Удалить устройство '+shortId+'?\n\nКлиент будет удалён со всех VPN-панелей и из БД.'))return;
+  if(!confirm('Удалить устройство '+shortId+'?\\n\\nКлиент будет удалён со всех VPN-панелей и из БД.'))return;
   const j=await(await fetch('/admin/api/device/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:uid,device_id:deviceId})})).json();
   if(j.status==='ok'){openUserDetail(uid);loadUsers();}else alert(j.msg||'Ошибка');
 }
 
 async function deleteAccount(uid){
-  if(!confirm('Удалить аккаунт пользователя?\n\nTG ID и флаг bonus_given сохранятся — повторный бонус клиент не получит.\nУстройства будут удалены с VPN-панелей и из БД.\nЭто действие необратимо.'))return;
+  if(!confirm('Удалить аккаунт пользователя?\\n\\nTG ID и флаг bonus_given сохранятся — повторный бонус клиент не получит.\\nУстройства будут удалены с VPN-панелей и из БД.\\nЭто действие необратимо.'))return;
   const j=await(await fetch('/admin/api/user/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:uid})})).json();
   if(j.status==='ok'){closeModal();loadUsers();alert('Аккаунт удалён. Устройств снято: '+(j.removed_devices||0));}else alert(j.msg||'Ошибка');
 }
