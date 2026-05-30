@@ -82,7 +82,7 @@ SCHEMA = [
         created_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
     );
     """,
-    # ── Bypass IP / домены ──
+    # ── Bypass IP / домены (deprecated — заменено на domain_pool, но таблица оставлена для бэкап-чтения) ──
     """
     CREATE TABLE IF NOT EXISTS bypass_ips (
         id         SERIAL PRIMARY KEY,
@@ -91,6 +91,33 @@ SCHEMA = [
         is_active  BOOLEAN      NOT NULL DEFAULT TRUE,
         sort_order INTEGER      NOT NULL DEFAULT 0,
         created_at TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
+    );
+    """,
+    # ── Пул доменов (host + опциональный port + label) ──
+    # Из этого пула админ назначает host'ы конкретным inbound'ам сервера.
+    """
+    CREATE TABLE IF NOT EXISTS domain_pool (
+        id         SERIAL PRIMARY KEY,
+        host       VARCHAR(255) NOT NULL,
+        port       INTEGER,
+        label      VARCHAR(255),
+        is_active  BOOLEAN      NOT NULL DEFAULT TRUE,
+        sort_order INTEGER      NOT NULL DEFAULT 0,
+        created_at TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
+    );
+    """,
+    # ── Per-inbound override host'а ──
+    # На каждый inbound каждого сервера можно назначить домен из domain_pool.
+    # Без override используется server.client_host или server.host (как сейчас).
+    """
+    CREATE TABLE IF NOT EXISTS inbound_host_overrides (
+        server_id      INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+        inbound_id     INTEGER NOT NULL,
+        inbound_remark VARCHAR(255),
+        inbound_port   INTEGER,
+        domain_id      INTEGER REFERENCES domain_pool(id) ON DELETE SET NULL,
+        updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (server_id, inbound_id)
     );
     """,
     # ── Контент бота: сообщения ──
@@ -141,7 +168,8 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_transactions_user_id ON transactions(user_id);",
     "CREATE INDEX IF NOT EXISTS idx_transactions_type_created ON transactions(type, created_at);",
     "CREATE INDEX IF NOT EXISTS idx_servers_sort ON servers(sort_order, id);",
-    "CREATE INDEX IF NOT EXISTS idx_bypass_sort ON bypass_ips(sort_order, id);",
+    "CREATE INDEX IF NOT EXISTS idx_domain_pool_sort ON domain_pool(sort_order, id);",
+    "CREATE INDEX IF NOT EXISTS idx_overrides_server ON inbound_host_overrides(server_id);",
     "CREATE INDEX IF NOT EXISTS idx_bot_buttons_menu ON bot_buttons(menu, row, position);",
 ]
 
@@ -171,16 +199,25 @@ async def _seed_servers(conn) -> None:
         )
 
 
-async def _seed_bypass(conn) -> None:
-    count = await conn.fetchval("SELECT COUNT(*) FROM bypass_ips")
-    if count or not config.BYPASS_IPS:
-        log.info("Bypass: пропуск (в БД %s, в .env %s)", count, len(config.BYPASS_IPS))
+async def _seed_domain_pool(conn) -> None:
+    """Однократная миграция: переносим записи из старой bypass_ips в новую
+    domain_pool, если последняя ещё пустая. Чтобы админ не терял свои домены."""
+    count = await conn.fetchval("SELECT COUNT(*) FROM domain_pool")
+    if count:
+        log.info("domain_pool: пропуск (в БД %s записей)", count)
         return
-    log.info("Переношу %s bypass-адрес(ов) из .env в БД", len(config.BYPASS_IPS))
-    for i, val in enumerate(config.BYPASS_IPS):
+    legacy = await conn.fetch(
+        "SELECT value, label, is_active, sort_order FROM bypass_ips ORDER BY sort_order, id"
+    )
+    if not legacy:
+        log.info("domain_pool: исходных bypass_ips нет, начинаем с пустой таблицы")
+        return
+    log.info("Переношу %s запис(ей) из bypass_ips в domain_pool", len(legacy))
+    for r in legacy:
         await conn.execute(
-            "INSERT INTO bypass_ips (value, label, is_active, sort_order) VALUES ($1,'',TRUE,$2)",
-            val, i,
+            """INSERT INTO domain_pool (host, port, label, is_active, sort_order)
+               VALUES ($1, NULL, $2, $3, $4)""",
+            r["value"], r["label"] or "", r["is_active"], r["sort_order"],
         )
 
 
@@ -212,7 +249,7 @@ async def main() -> None:
     try:
         await _create_schema(conn)
         await _seed_servers(conn)
-        await _seed_bypass(conn)
+        await _seed_domain_pool(conn)
         await _seed_bot_content(conn)
         log.info("✅ Миграция завершена успешно")
     finally:

@@ -25,7 +25,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 
 import bot_content
 import broadcast
-import bypass_store
+import domain_store
+import inbound_overrides_store
 import config
 import config_files
 import error_log
@@ -306,56 +307,121 @@ async def api_user_delete(request: Request):
         return {"status": "error", "msg": str(e)}
 
 
-# ──────────── BYPASS ────────────
-@router.get("/api/bypass")
-async def api_bypass_list(request: Request):
+# ──────────── ДОМЕНЫ (пул для override'ов inbound'ов) ────────────
+@router.get("/api/domains")
+async def api_domains_list(request: Request):
     if not _is_authed(request):
         return _need_login_json()
     async with request.app.state.db.acquire() as conn:
-        items = await bypass_store.list_bypass(conn)
+        items = await domain_store.list_all(conn)
     return {"status": "ok", "items": items}
 
 
-@router.post("/api/bypass/save")
-async def api_bypass_save(request: Request):
+@router.post("/api/domains/save")
+async def api_domains_save(request: Request):
     if not _is_authed(request):
         return _need_login_json()
     data = await request.json()
-    if not data.get("value"):
-        return {"status": "error", "msg": "Укажите IP или домен"}
+    host = (data.get("host") or "").strip()
+    if not host:
+        return {"status": "error", "msg": "Укажите хост"}
+    raw_port = data.get("port")
+    port = int(raw_port) if str(raw_port or "").strip().isdigit() else None
     try:
         async with request.app.state.db.acquire() as conn:
             if data.get("id"):
-                await bypass_store.update_bypass(conn, data["id"], data["value"], data.get("label", ""))
+                await domain_store.update(conn, data["id"], host, port, data.get("label", ""))
             else:
-                await bypass_store.add_bypass(conn, data["value"], data.get("label", ""))
+                await domain_store.add(conn, host, port, data.get("label", ""))
         return {"status": "ok"}
     except Exception as e:
         return {"status": "error", "msg": str(e)}
 
 
-@router.post("/api/bypass/delete")
-async def api_bypass_delete(request: Request):
+@router.post("/api/domains/delete")
+async def api_domains_delete(request: Request):
     if not _is_authed(request):
         return _need_login_json()
     data = await request.json()
     try:
         async with request.app.state.db.acquire() as conn:
-            await bypass_store.delete_bypass(conn, data["id"])
+            await domain_store.delete(conn, data["id"])
         return {"status": "ok"}
     except Exception as e:
         return {"status": "error", "msg": str(e)}
 
 
-@router.post("/api/bypass/toggle")
-async def api_bypass_toggle(request: Request):
+@router.post("/api/domains/toggle")
+async def api_domains_toggle(request: Request):
     if not _is_authed(request):
         return _need_login_json()
     data = await request.json()
     try:
         async with request.app.state.db.acquire() as conn:
-            st = await bypass_store.toggle_bypass(conn, data["id"])
+            st = await domain_store.toggle(conn, data["id"])
         return {"status": "ok", "is_active": st}
+    except Exception as e:
+        return {"status": "error", "msg": str(e)}
+
+
+# ──────────── INBOUNDS со всех серверов + per-inbound override ────────────
+@router.get("/api/inbounds/all")
+async def api_inbounds_all(request: Request):
+    """Параллельно тянет inbound'ы со всех активных серверов и склеивает с
+    текущими override'ами + доступным пулом доменов."""
+    if not _is_authed(request):
+        return _need_login_json()
+    async with request.app.state.db.acquire() as conn:
+        servers = await server_store.list_servers(conn)
+        domains = await domain_store.list_active(conn)
+        ov_rows = await inbound_overrides_store.list_all(conn)
+    active = [s for s in servers if s.get("is_active")]
+    rows = await xray_api.fetch_all_inbounds(active)
+    ov_idx = {(r["server_id"], r["inbound_id"]): r for r in ov_rows}
+
+    out = []
+    for r in rows:
+        inb = r["inbound"]
+        key = (r["server_id"], inb["id"])
+        ov = ov_idx.get(key) or {}
+        out.append({
+            "server_id": r["server_id"],
+            "server_name": r["server_name"],
+            "server_host": r["server_host"],
+            "server_client_host": r["server_client_host"],
+            "inbound_id": inb["id"],
+            "port": inb.get("port"),
+            "remark": inb.get("remark") or "",
+            "protocol": inb.get("protocol") or "",
+            "enable": inb.get("enable", True),
+            "domain_id": ov.get("domain_id"),
+            "domain_label": ov.get("domain_label"),
+            "domain_host": ov.get("domain_host"),
+        })
+    return {"status": "ok", "items": out, "domains": domains}
+
+
+@router.post("/api/inbounds/override")
+async def api_inbounds_override(request: Request):
+    """Назначает (или сбрасывает) override-домен для (server_id, inbound_id).
+    domain_id=null/0 → возвращаемся к server.host."""
+    if not _is_authed(request):
+        return _need_login_json()
+    data = await request.json()
+    sid = data.get("server_id")
+    iid = data.get("inbound_id")
+    did = data.get("domain_id")
+    if sid is None or iid is None:
+        return {"status": "error", "msg": "Нужны server_id и inbound_id"}
+    try:
+        async with request.app.state.db.acquire() as conn:
+            await inbound_overrides_store.set_override(
+                conn, int(sid), int(iid),
+                int(did) if did else None,
+                remark=data.get("remark"),
+                port=int(data["port"]) if data.get("port") else None,
+            )
+        return {"status": "ok"}
     except Exception as e:
         return {"status": "error", "msg": str(e)}
 
@@ -579,7 +645,8 @@ DASHBOARD_HTML = """<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">
   <div class="flex gap-1 bg-gray-800 rounded-xl p-1 mb-6 border border-gray-700 overflow-x-auto">
     <button id="tab-servers" onclick="switchTab('servers')" class="tabbtn bg-gray-700 font-semibold"><i class="fa-solid fa-server mr-1"></i> Серверы</button>
     <button id="tab-users" onclick="switchTab('users')" class="tabbtn text-gray-400"><i class="fa-solid fa-users mr-1"></i> Пользователи</button>
-    <button id="tab-bypass" onclick="switchTab('bypass')" class="tabbtn text-gray-400"><i class="fa-solid fa-shuffle mr-1"></i> Bypass</button>
+    <button id="tab-domains" onclick="switchTab('domains')" class="tabbtn text-gray-400"><i class="fa-solid fa-globe mr-1"></i> Домены</button>
+    <button id="tab-inbounds" onclick="switchTab('inbounds')" class="tabbtn text-gray-400"><i class="fa-solid fa-network-wired mr-1"></i> Inbounds</button>
     <button id="tab-files" onclick="switchTab('files')" class="tabbtn text-gray-400"><i class="fa-solid fa-file-code mr-1"></i> Файлы</button>
     <button id="tab-bot" onclick="switchTab('bot')" class="tabbtn text-gray-400"><i class="fa-solid fa-robot mr-1"></i> Бот</button>
     <button id="tab-system" onclick="switchTab('system')" class="tabbtn text-gray-400"><i class="fa-solid fa-power-off mr-1"></i> Система</button>
@@ -646,14 +713,24 @@ DASHBOARD_HTML = """<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">
     </div>
   </div>
 
-  <!-- BYPASS -->
-  <div id="view-bypass" class="hidden">
+  <!-- ДОМЕНЫ (пул для override'ов) -->
+  <div id="view-domains" class="hidden">
     <div class="flex justify-between items-center mb-3">
-      <h2 class="text-lg font-bold">Адреса обхода (Bypass)</h2>
-      <button onclick="openBypassModal()" class="text-sm bg-blue-500/20 text-blue-400 hover:bg-blue-500/30 px-3 py-1.5 rounded-lg font-semibold"><i class="fa-solid fa-plus mr-1"></i> Добавить</button>
+      <h2 class="text-lg font-bold">Пул доменов</h2>
+      <button onclick="openDomainModal()" class="text-sm bg-blue-500/20 text-blue-400 hover:bg-blue-500/30 px-3 py-1.5 rounded-lg font-semibold"><i class="fa-solid fa-plus mr-1"></i> Добавить</button>
     </div>
-    <p class="text-xs text-gray-500 mb-4">Если у inbound в 3x-ui в названии есть слово <b class="text-gray-300">BYPASS</b>, в ссылку вместо адреса сервера подставляется один из этих адресов (по очереди: ОБХОД 1, ОБХОД 2…). Можно держать 0, 1 или несколько — выключенные не используются.</p>
-    <div id="bypass-list" class="space-y-3"><div class="text-gray-500 text-center py-8">Загрузка...</div></div>
+    <p class="text-xs text-gray-500 mb-4">Эти домены/IP доступны во вкладке <b class="text-gray-300">Inbounds</b> для назначения конкретным inbound'ам сервера вместо его собственного host'а. Порт опциональный — если не указан, берётся порт inbound'а.</p>
+    <div id="domains-list" class="space-y-3"><div class="text-gray-500 text-center py-8">Загрузка...</div></div>
+  </div>
+
+  <!-- INBOUNDS со всех серверов -->
+  <div id="view-inbounds" class="hidden">
+    <div class="flex justify-between items-center mb-3">
+      <h2 class="text-lg font-bold">Inbounds (все серверы)</h2>
+      <button onclick="loadInbounds()" class="text-sm bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded-lg font-semibold"><i class="fa-solid fa-rotate mr-1"></i> Обновить</button>
+    </div>
+    <p class="text-xs text-gray-500 mb-4">Все inbound'ы с активных серверов. Для каждого — dropdown с host'ом: «свой IP сервера» (по умолчанию) или один из доменов пула. Выбор сохраняется при изменении.</p>
+    <div id="inbounds-list" class="space-y-2"><div class="text-gray-500 text-center py-8">Загрузка...</div></div>
   </div>
 
   <!-- ФАЙЛЫ -->
@@ -819,17 +896,19 @@ DASHBOARD_HTML = """<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">
   </div>
 </div>
 
-<!-- МОДАЛКА: bypass -->
-<div id="bypass-modal" class="hidden fixed inset-0 z-50 p-4 items-center justify-center overflow-y-auto">
+<!-- МОДАЛКА: домен из пула -->
+<div id="domain-modal" class="hidden fixed inset-0 z-50 p-4 items-center justify-center overflow-y-auto">
   <div class="bg-gray-800 w-full max-w-sm rounded-3xl p-6 border border-gray-700 shadow-2xl my-auto">
-    <div class="flex justify-between items-center mb-4"><h3 class="text-xl font-bold">Bypass-адрес</h3>
+    <div class="flex justify-between items-center mb-4"><h3 class="text-xl font-bold">Домен</h3>
       <button onclick="closeModal()" class="text-gray-400 hover:text-white"><i class="fa-solid fa-xmark text-xl"></i></button></div>
-    <input type="hidden" id="b-id">
-    <label class="text-xs text-gray-400">IP или домен</label>
-    <input id="b-value" class="inp mb-3" placeholder="158.160.223.89 или proxy.example.com">
+    <input type="hidden" id="d-id">
+    <label class="text-xs text-gray-400">Хост (IP или домен)</label>
+    <input id="d-host" class="inp mb-3" placeholder="cdn.example.com или 1.2.3.4">
+    <label class="text-xs text-gray-400">Порт (опционально, иначе берётся из inbound'а)</label>
+    <input id="d-port" type="number" min="1" max="65535" class="inp mb-3" placeholder="напр. 443">
     <label class="text-xs text-gray-400">Метка (необязательно)</label>
-    <input id="b-label" class="inp mb-4" placeholder="например: Yandex Cloud">
-    <button onclick="saveBypass()" class="w-full bg-green-600 hover:bg-green-500 font-bold py-3 rounded-xl"><i class="fa-solid fa-check mr-1"></i> Сохранить</button>
+    <input id="d-label" class="inp mb-4" placeholder="напр. Швейцария">
+    <button onclick="saveDomain()" class="w-full bg-green-600 hover:bg-green-500 font-bold py-3 rounded-xl"><i class="fa-solid fa-check mr-1"></i> Сохранить</button>
   </div>
 </div>
 
@@ -865,16 +944,17 @@ DASHBOARD_HTML = """<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">
 </div>
 
 <script>
-let servers=[], users=[], bypassItems=[];
+let servers=[], users=[], domainItems=[], inboundRows=[], inboundDomains=[];
 let uState={search:'',status:'all',sort:'topup_total',page:1,page_size:25,pages:1};
 
 function switchTab(t){
-  ['servers','users','bypass','files','bot','system','errors'].forEach(n=>{
+  ['servers','users','domains','inbounds','files','bot','system','errors'].forEach(n=>{
     document.getElementById('view-'+n).classList.toggle('hidden', n!==t);
     document.getElementById('tab-'+n).className='tabbtn '+(n===t?'bg-gray-700 font-semibold':'text-gray-400');
   });
   if(t==='users') loadUsers();
-  if(t==='bypass') loadBypass();
+  if(t==='domains') loadDomains();
+  if(t==='inbounds') loadInbounds();
   if(t==='files') loadFilesList();
   if(t==='bot') switchBot(botSub);
   if(t==='system') loadSystem();
@@ -1085,35 +1165,90 @@ async function deleteAccount(uid){
   if(j.status==='ok'){closeModal();loadUsers();alert('Аккаунт удалён. Устройств снято: '+(j.removed_devices||0));}else alert(j.msg||'Ошибка');
 }
 
-/* ---- BYPASS ---- */
-async function loadBypass(){
-  const j=await(await fetch('/admin/api/bypass')).json(); bypassItems=j.items||[];
-  const box=document.getElementById('bypass-list');
-  if(!bypassItems.length){box.innerHTML='<div class="text-gray-500 text-center py-8">Список пуст. BYPASS-ссылки будут использовать адрес самого сервера.</div>';return;}
-  box.innerHTML=bypassItems.map((b,i)=>{
-    const dot=b.is_active?'bg-green-500':'bg-gray-600';
+/* ---- ДОМЕНЫ (пул) ---- */
+async function loadDomains(){
+  const j=await(await fetch('/admin/api/domains')).json(); domainItems=j.items||[];
+  const box=document.getElementById('domains-list');
+  if(!domainItems.length){box.innerHTML='<div class="text-gray-500 text-center py-8">Пул пуст. Добавьте домены, чтобы назначать их inbound\\'ам.</div>';return;}
+  box.innerHTML=domainItems.map(d=>{
+    const dot=d.is_active?'bg-green-500':'bg-gray-600';
+    const portTxt=d.port?(':'+d.port):'';
     return `<div class="bg-gray-800 rounded-2xl p-4 border border-gray-700 flex items-center justify-between gap-3">
-      <div class="min-w-0"><div class="font-bold flex items-center gap-2"><span class="w-2.5 h-2.5 rounded-full ${dot}"></span> ${esc(b.value)}</div>
-      <div class="text-xs text-gray-500 mt-1">${b.is_active?('ОБХОД '+(i+1)):'выключен'}${b.label?' · '+esc(b.label):''}</div></div>
+      <div class="min-w-0"><div class="font-bold flex items-center gap-2"><span class="w-2.5 h-2.5 rounded-full ${dot}"></span> ${esc(d.host)}${portTxt}</div>
+      <div class="text-xs text-gray-500 mt-1">${d.is_active?'активен':'выключен'}${d.label?' · '+esc(d.label):''}</div></div>
       <div class="flex items-center gap-2 flex-shrink-0">
-        <button onclick="toggleBypass(${b.id})" class="bg-gray-700 hover:bg-gray-600 w-9 h-9 rounded-lg"><i class="fa-solid fa-power-off ${b.is_active?'text-green-400':'text-gray-500'}"></i></button>
-        <button onclick="openBypassModal(${b.id})" class="bg-gray-700 hover:bg-gray-600 w-9 h-9 rounded-lg"><i class="fa-solid fa-pen"></i></button>
-        <button onclick="deleteBypass(${b.id})" class="bg-red-600/20 text-red-400 hover:bg-red-600/30 w-9 h-9 rounded-lg"><i class="fa-solid fa-trash-can"></i></button>
+        <button onclick="toggleDomain(${d.id})" class="bg-gray-700 hover:bg-gray-600 w-9 h-9 rounded-lg"><i class="fa-solid fa-power-off ${d.is_active?'text-green-400':'text-gray-500'}"></i></button>
+        <button onclick="openDomainModal(${d.id})" class="bg-gray-700 hover:bg-gray-600 w-9 h-9 rounded-lg"><i class="fa-solid fa-pen"></i></button>
+        <button onclick="deleteDomain(${d.id})" class="bg-red-600/20 text-red-400 hover:bg-red-600/30 w-9 h-9 rounded-lg"><i class="fa-solid fa-trash-can"></i></button>
       </div></div>`;
   }).join('');
 }
-function openBypassModal(id){const b=id?bypassItems.find(x=>x.id===id):null;
-  document.getElementById('b-id').value=b?b.id:'';
-  document.getElementById('b-value').value=b?b.value:'';
-  document.getElementById('b-label').value=b?(b.label||''):'';
-  showModal('bypass-modal');}
-async function saveBypass(){const body={id:document.getElementById('b-id').value||null,value:document.getElementById('b-value').value.trim(),label:document.getElementById('b-label').value.trim()};
-  if(!body.value){alert('Укажите IP или домен');return;}
-  const j=await(await fetch('/admin/api/bypass/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
-  if(j.status==='ok'){closeModal();loadBypass();}else alert(j.msg||'Ошибка');}
-async function deleteBypass(id){if(!confirm('Удалить адрес обхода?'))return;
-  await fetch('/admin/api/bypass/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});loadBypass();}
-async function toggleBypass(id){await fetch('/admin/api/bypass/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});loadBypass();}
+function openDomainModal(id){const d=id?domainItems.find(x=>x.id===id):null;
+  document.getElementById('d-id').value=d?d.id:'';
+  document.getElementById('d-host').value=d?d.host:'';
+  document.getElementById('d-port').value=d&&d.port?d.port:'';
+  document.getElementById('d-label').value=d?(d.label||''):'';
+  showModal('domain-modal');}
+async function saveDomain(){
+  const body={
+    id:document.getElementById('d-id').value||null,
+    host:document.getElementById('d-host').value.trim(),
+    port:document.getElementById('d-port').value.trim()||null,
+    label:document.getElementById('d-label').value.trim(),
+  };
+  if(!body.host){alert('Укажите хост');return;}
+  const j=await(await fetch('/admin/api/domains/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+  if(j.status==='ok'){closeModal();loadDomains();}else alert(j.msg||'Ошибка');}
+async function deleteDomain(id){if(!confirm('Удалить домен из пула?'))return;
+  await fetch('/admin/api/domains/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});loadDomains();}
+async function toggleDomain(id){await fetch('/admin/api/domains/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});loadDomains();}
+
+/* ---- INBOUNDS со всех серверов ---- */
+async function loadInbounds(){
+  const box=document.getElementById('inbounds-list');
+  box.innerHTML='<div class="text-gray-500 text-center py-8">Тяну inbound\\'ы со всех серверов...</div>';
+  const j=await(await fetch('/admin/api/inbounds/all')).json();
+  if(j.status!=='ok'){box.innerHTML='<div class="text-red-400 text-center py-8">'+esc(j.msg||'Ошибка')+'</div>';return;}
+  inboundRows=j.items||[]; inboundDomains=j.domains||[];
+  if(!inboundRows.length){box.innerHTML='<div class="text-gray-500 text-center py-8">Нет ни одного inbound\\'а (проверь авторизацию на серверах).</div>';return;}
+  // Группируем по серверу для удобства
+  const groups={};
+  inboundRows.forEach(r=>{(groups[r.server_id]=groups[r.server_id]||{name:r.server_name,host:r.server_client_host||r.server_host,items:[]}).items.push(r);});
+  box.innerHTML=Object.entries(groups).map(([sid,g])=>{
+    const header=`<div class="text-xs text-gray-400 uppercase tracking-wider mb-2 mt-3"><i class="fa-solid fa-server mr-1"></i>${esc(g.name)} <span class="text-gray-600">· свой IP: ${esc(g.host)}</span></div>`;
+    const rows=g.items.map(r=>{
+      const opts=[`<option value="">свой IP сервера (${esc(g.host)})</option>`]
+        .concat(inboundDomains.map(d=>{
+          const sel=(r.domain_id===d.id)?' selected':'';
+          const portTxt=d.port?(':'+d.port):'';
+          const labelTxt=d.label?(' — '+d.label):'';
+          return `<option value="${d.id}"${sel}>${esc(d.host)}${esc(portTxt)}${esc(labelTxt)}</option>`;
+        })).join('');
+      const protoBadge=`<span class="text-[10px] bg-gray-700 text-gray-300 px-1.5 py-0.5 rounded uppercase">${esc(r.protocol||'?')}</span>`;
+      const enableBadge=r.enable?'':'<span class="text-[10px] bg-red-500/20 text-red-400 px-1.5 py-0.5 rounded ml-1">выключен</span>';
+      return `<div class="bg-gray-800 rounded-xl p-3 border border-gray-700 flex items-center gap-3">
+        <div class="flex-1 min-w-0">
+          <div class="font-semibold text-sm truncate">${esc(r.remark||'(без названия)')} ${protoBadge}${enableBadge}</div>
+          <div class="text-xs text-gray-500 font-mono">id=${r.inbound_id} · port ${r.port||'?'}</div>
+        </div>
+        <select onchange="setInboundOverride(${sid},${r.inbound_id},this.value,'${esc(r.remark||'')}',${r.port||'null'})" class="bg-gray-900 border border-gray-700 rounded-lg px-2 py-1.5 text-sm min-w-[220px] max-w-[300px]">${opts}</select>
+      </div>`;
+    }).join('');
+    return header+rows;
+  }).join('');
+}
+
+async function setInboundOverride(serverId, inboundId, domainId, remark, port){
+  const body={
+    server_id:serverId,
+    inbound_id:inboundId,
+    domain_id:domainId?parseInt(domainId):null,
+    remark:remark||null,
+    port:(port&&port!=='null')?parseInt(port):null,
+  };
+  const j=await(await fetch('/admin/api/inbounds/override',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+  if(j.status!=='ok')alert(j.msg||'Ошибка');
+}
 
 /* ---- ФАЙЛЫ ---- */
 let filesMeta=[];
